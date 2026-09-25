@@ -2,6 +2,39 @@
 
 All notable SecHelix release changes are summarized here. Detailed release notes live in [`docs/releases/`](docs/releases/), and the Git history remains the authoritative development record.
 
+## [Unreleased]
+
+- First measurement on real code: `evals/cve_pairs.py` reviewed the vulnerable and patched trees of 12 public CVEs blind. SecHelix found **2 of 12** known defects under the pre-registered rule and 3 with disclosed hand adjudication; **no finding it marked `VERIFIED` was a known defect**, and 10 of the 14 `VERIFIED` findings were in patched trees. Published as measured in [`docs/research/cve-pairs-2026-09-21.md`](docs/research/cve-pairs-2026-09-21.md), with the manifest, every adjudication and the scored result. Findings about other projects that do not match a published CVE are counted but withheld.
+- README: the non-claims section now states that result, and corrects "refuses to report unproven claims" — unproven claims are labelled, not dropped (92 of 106 in that run).
+
+## [4.0.0-alpha.7] - 2026-09-21
+
+- The installed skill now ships instructions and data only. `sechelix_core`, the scanner adapters, the report renderer and six scripts are no longer copied into `skills/sechelix/`: 52 Python files that no review step executes, and executable surface that every install-time security audit has to judge. The bundle drops from 160 files / 2.0 MB to 102 files / 1.46 MB with zero executable files.
+- The optional helpers are unchanged and stay where they are installable: `python -m pip install sechelix` for the CLI and the `sechelix_core` modules `SKILL.md` names, and a repository clone for the release gate, renderer, adapters and validators. `references/runtime.md` and `SKILL.md` now state which source provides what, and that the workflow requires neither.
+- `scripts/validate_skill.py` fails if any executable file returns to the bundle, with a regression test beside it. The "portable isolation" claim in the compatibility matrix is restated to match what now ships.
+
+See [release notes](docs/releases/4.0.0-alpha.7.md).
+
+## [4.0.0-alpha.6] - 2026-09-15
+
+- Added `distributions/awesome-copilot/`, a curated runtime-free Agent Plugin with one skill, `sechelix-lite`: a 197-line `SKILL.md` and five references for evidence-first AppSec review with independent verification. It carries no SEO or cleanup workflow, catalog, runtime or product copy. The full skill is unchanged.
+- Added `scripts/validate_distribution.py` to CI. It enforces the edition's line, file and byte budgets, Agent Plugins v1.0.0 manifest rules, release-version match, runtime independence, schema vocabularies, scope and secret checks, and a copy-install. Mutation tests cover each gate.
+- Trimmed the canonical `SKILL.md` from 483 to 433 lines by moving runtime resource lists and commands to `references/runtime.md`; no methodology rule was removed. It also corrected a stale "fifteen" schema count (the tree has 22), and `check_doc_consistency.py` now checks that file.
+- `sync_portable_skill.py` now prunes stale files. The portable bundle drops a stale `agents/README.md`, the deliberately vulnerable demo app and derived report renderings: 175 to 160 files.
+- README: added what SecHelix does not claim, and moved the optional SEO/cleanup workflows out of the security usage path.
+- CI: the commit-hygiene body-length rule no longer applies to Dependabot's generated release notes (#88); CodeQL and deploy-pages actions bumped (#87).
+
+See [release notes](docs/releases/4.0.0-alpha.6.md).
+
+## [4.0.0-alpha.5] - 2026-09-13
+
+- Added agent-guided SEO Audit and Codebase Cleanup workflows, with evidence-backed findings, risk/impact estimates, staged remediation and verification.
+- Added audit-only and combined audit/fix/verify prompts to the command cookbook and routed discovery adapters through the canonical Skill.
+- Preserved security catalog/gate semantics and the optional runner at 0.3.0; no new CLI scanner commands.
+- Corrected the canonical Skill path in AGENTS.md and synchronized the portable distribution.
+
+See [release notes](docs/releases/4.0.0-alpha.5.md).
+
 ## [4.0.0-alpha.4] - 2026-09-09
 
 - Shortened the `action.yml` description from 188 to 113 characters. GitHub Marketplace rejects a listing whose description is 125 characters or more, so the action could not be published; a folded YAML scalar hid the length from anyone counting lines rather than characters. **No behaviour changed** — inputs, outputs, steps and the fail-closed decision logic are exactly what `4.0.0-alpha.3` shipped.

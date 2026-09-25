@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Build the self-contained Agent Skills distribution from canonical sources."""
+"""Build the Agent Skills distribution from canonical sources.
+
+The installed skill is instructions and data: the workflow, the reference material, the
+specialist profiles, the hypothesis catalog, the contracts, the packs and the examples an
+agent reads while reviewing. It ships no executable code.
+
+Executable helpers are distributed where they are actually installable:
+
+- `python -m pip install sechelix` provides the `sechelix` CLI and the importable
+  `sechelix_core` helpers that SKILL.md calls;
+- the source repository provides the release gate, the report renderer, the scanner
+  adapters and the validators.
+
+Shipping them inside the skill instead put 52 Python files on every user's machine for no
+review step that executes them, and handed every install-time security audit an executable
+surface to judge. `scripts/validate_skill.py` fails if code returns to the bundle.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +27,6 @@ ROOT = Path(__file__).resolve().parents[1]
 DEST = ROOT / "skills" / "sechelix"
 
 DIRECTORIES = (
-    "adapters",
     "agents",
     "catalog",
     "examples",
@@ -19,9 +34,7 @@ DIRECTORIES = (
     "knowledge",
     "policies",
     "references",
-    "reports",
     "schemas",
-    "sechelix_core",
 )
 
 EXCLUDED_PARTS = {"__pycache__", "tests"}
@@ -33,16 +46,17 @@ EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 #: it would roughly double the bundle for something no review step ever opens.
 EXCLUDED_TREES = (
     Path("examples/expense-api"),
+    # Deliberately vulnerable teaching code for the Action self-test. Shipping it
+    # inside an installed skill would put known-vulnerable source on every user's
+    # machine for no review step that reads it.
+    Path("examples/demo-app"),
+    # Renderings derived from examples/report.example.json, which does ship. The
+    # renderer reproduces them on demand.
+    Path("examples/reports"),
 )
 
-SCRIPT_FILES = (
-    "applicability.py",
-    "attack_surface.py",
-    "security_gate.py",
-    "validate_contract.py",
-    "validate_knowledge.py",
-    "validate_gold_packs.py",
-)
+#: Authored in place in the bundle, never copied from a canonical source.
+AUTHORED_IN_PLACE = frozenset({"SKILL.md"})
 
 def include(path: Path) -> bool:
     relative = path.relative_to(ROOT)
@@ -76,18 +90,34 @@ def sync() -> list[Path]:
             copy_file(source, destination)
             copied.append(destination)
 
-    for name in SCRIPT_FILES:
-        source = ROOT / "scripts" / name
-        destination = DEST / "scripts" / name
-        copy_file(source, destination)
-        copied.append(destination)
-
     return copied
+
+
+def prune(copied: list[Path]) -> list[Path]:
+    """Delete bundle files that no canonical source produces any more.
+
+    Without this, a file removed or excluded upstream lives on in every install,
+    and the drift check cannot see it because the stale copy is still tracked.
+    """
+    keep = {path.resolve() for path in copied}
+    keep.update((DEST / name).resolve() for name in AUTHORED_IN_PLACE)
+    removed = []
+    for path in sorted(DEST.rglob("*"), reverse=True):
+        if path.is_file() and path.resolve() not in keep:
+            path.unlink()
+            removed.append(path)
+        elif path.is_dir() and not any(path.iterdir()):
+            path.rmdir()
+    return removed
 
 
 def main() -> int:
     copied = sync()
-    print(f"OK: synchronized {len(copied)} files into {DEST.relative_to(ROOT)}")
+    removed = prune(copied)
+    print(
+        f"OK: synchronized {len(copied)} files into {DEST.relative_to(ROOT)}"
+        + (f"; pruned {len(removed)} stale file(s)" if removed else "")
+    )
     return 0
 
 

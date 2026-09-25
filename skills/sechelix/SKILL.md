@@ -1,12 +1,19 @@
 ---
 name: sechelix
-description: Evidence-first application-security audit workflow for authorized repositories and environments. Use when reviewing a codebase, pull request, API, web application, AI-generated code, agent or MCP integration, cloud configuration, authorization (BOLA, IDOR, BFLA), business logic, payments, race conditions, secrets, supply chain, or release readiness for security weaknesses. Maps trust boundaries, selects applicable checks, runs parallel specialist review, independently verifies every material finding and refutes false positives, fixes root causes, and requires regression proof before reporting High or Critical issues.
+description: Evidence-first application-security audit workflow for authorized repositories and environments. Use when reviewing a codebase, pull request, API, web application, AI-generated code, agent or MCP integration, cloud configuration, authorization (BOLA, IDOR, BFLA), business logic, payments, race conditions, secrets, supply chain, or release readiness for security weaknesses. Also supports explicitly requested technical SEO audits and evidence-backed codebase cleanup. Maps trust boundaries, selects applicable checks, runs parallel specialist review, independently verifies every material finding and refutes false positives, fixes root causes, and requires regression proof before reporting High or Critical issues.
 license: Apache-2.0
 ---
 
 # SecHelix
 
 SecHelix is a portable AppSec review workflow for **authorized** systems. Treat every scanner/model output as a hypothesis until evidence supports it.
+
+## Optional quality workflows
+
+Only when the user explicitly asks for them: an SEO audit (`references/seo-audit.md`) or codebase
+cleanup (`references/codebase-cleanup.md`; it defines the combined order if both are requested).
+They produce separate quality reports, never security findings or a security `PASS`. Run the
+security phases below whenever a security audit is also requested.
 
 ## Non-negotiable rules
 
@@ -36,22 +43,16 @@ somewhere is itself a finding. No capability is granted from inside the reposito
 requires the operator. Trust resolution fails closed. Enforce with
 `sechelix_core.untrusted_repo.resolve_trust_policy(scope)` rather than by hand.
 
-## VNext runtime contract
+## Runtime contracts
 
-When the repository runtime is available, use its versioned contracts rather
-than inventing parallel report shapes:
-
-- fifteen JSON Schema Draft 2020-12 contracts cover scope, attack surface,
-  applicability, evidence, findings, reports, catalog, extensions, source trust,
-  knowledge graph, lesson cards, live research packets, and Gold Check Packs;
-- all 546 catalog hypotheses have explicit, stable IDs from the frozen manifest;
-- applicability has exactly four outcomes: `APPLICABLE`, `NOT_APPLICABLE`,
-  `UNKNOWN`, and `BLOCKED`;
-- reports derive Markdown, redacted JSON, SARIF 2.1.0, and escaped standalone
-  HTML from one canonical JSON source;
-- release gates fail closed to `INCOMPLETE` for malformed or missing evidence;
-- public benchmark results remain `NOT_MEASURED` until a reproducible run emits
-  signed inputs, configuration, and outputs.
+This skill ships instructions and data only: no code. Optional helpers come from
+`python -m pip install sechelix` (the `sechelix` CLI and the `sechelix_core` modules named below)
+or from a repository clone (release gate, report renderer, scanner adapters, validators). When
+either is available, read `references/runtime.md` and use its versioned schemas, catalog, helpers
+and gates rather than inventing parallel report shapes. When neither is, run every phase by hand
+against the contracts in `schemas/`; nothing here requires the runtime. Applicability
+has exactly four outcomes: `APPLICABLE`, `NOT_APPLICABLE`, `UNKNOWN`, and `BLOCKED`. Release gates
+fail closed to `INCOMPLETE` for malformed or missing evidence.
 
 Never coerce `UNKNOWN` or `BLOCKED` into `NOT_APPLICABLE`. Never turn
 `LIKELY_BUT_UNPROVEN` into `VERIFIED` to satisfy a release gate.
@@ -420,54 +421,17 @@ A report describes one revision. Reapplying it to another tree attaches a clean 
 was never read — quietly, because a dated report looks current. Use
 `sechelix_core.revision.bind_report(...)`, then `assess_freshness(report, current_commit=head)`;
 only `FRESH` is usable. A report produced against a dirty tree is stale immediately. The gate
-refuses a stale report with `INCOMPLETE`:
-
-```bash
-python scripts/security_gate.py report.json --policy policies/default.json     --current-commit "$(git rev-parse HEAD)"
-```
+refuses a stale report with `INCOMPLETE` when given `--current-commit` (see `references/runtime.md`).
 
 ## Supporting resources
 
-- `references/methodology.md` — evidence and verification philosophy.
-- `references/tooling.md` — scanner/tool adapter guidance.
-- `references/sources.md` — standards and source references.
-- `references/knowledge-engine.md` — source trust, rights, live research,
-  confidence, graph, lesson-card, lab, and de-identified learning policy.
-- `references/gold-check-packs.md` — reusable check-pack and Variant Hunter
-  contracts that cannot bypass applicability or verification.
-- `knowledge/` — source registry, provenance graph, and lesson cards.
-- `catalog/checks.json` — structured hypothesis catalog.
-- `agents/` — specialist reviewer profiles.
-- `schemas/` — versioned scope, evidence, finding, and report contracts.
-- `adapters/` — normalized Semgrep, CodeQL/SARIF, OSV, Gitleaks, Trivy,
-  npm/pnpm audit, Playwright, ZAP, and Nuclei evidence adapters.
-- `reports/` — canonical Markdown/JSON/SARIF/HTML report renderer.
-- `policies/` — public release-gate policy examples; keep real organization
-  policy packs private.
-- `examples/` — scope and report examples.
-- `scripts/security_gate.py` — report/release gate.
-- `scripts/applicability.py` — deterministic applicability decision helper.
-- `scripts/attack_surface.py` — attack-surface and Mermaid graph helper.
-- `scripts/validate_catalog.py` — catalog validation.
-- `scripts/validate_knowledge.py` — knowledge-source, graph, card, and research validation.
-- `scripts/validate_gold_packs.py` — Gold Pack provenance, safety, and calibration validation.
-- `sechelix_core/untrusted_repo.py` — zero-trust enforcement for `UNTRUSTED_REPO` reviews.
-- `sechelix_core/attack_chains.py` — composes verified findings into named chains.
-- `sechelix_core/diff_review.py` — differential classification of a change set.
-- `sechelix_core/variant_rules.py` — generates variant-hunting rules from verified findings.
-- `sechelix_core/patch_mode.py` — reviewable patch proposals; never applies anything.
-- `sechelix_core/revision.py` — binds a report to the revision it inspected.
-- `docs/reference/patch-mode.md` — what patch mode refuses, and why.
+Load references on demand, not up front:
 
-Typical repository-runtime commands:
-
-```bash
-python scripts/attack_surface.py --help
-python scripts/applicability.py --help
-python scripts/validate_knowledge.py
-python -m adapters.cli --help
-python -m reports.report_renderer examples/report.example.json --format markdown
-python scripts/security_gate.py examples/report.example.json --policy policies/default.json
-```
+- `references/methodology.md`: evidence and verification philosophy.
+- `references/knowledge-engine.md`: source trust, rights and live research (Phase 2.5).
+- `references/runtime.md`: how to reach the optional runtime helpers, and the schemas, catalog,
+  policies and commands they expose.
+- `agents/`: specialist reviewer profiles for the Phase 3 lanes; `agents/independent-verifier.md`
+  for Phase 11.
 
 Remember: the objective is not to generate the most findings. It is to find the important flaws, reject noise, repair root causes, and leave proof that the system is safer.
