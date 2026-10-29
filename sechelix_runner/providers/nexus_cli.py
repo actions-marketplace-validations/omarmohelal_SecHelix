@@ -120,15 +120,28 @@ class NexusCliExecutor:
         prompt: str,
         *,
         timeout: float = 300.0,
+        response_schema: dict[str, Any] | None = None,
     ) -> ProviderResult:
-        """Use Nexus role staffing while keeping verifier routing independent."""
+        """Use Nexus role staffing while keeping verifier routing independent.
+
+        ``response_schema`` is accepted for call-site uniformity but ignored: the
+        Nexus CLI has no OpenAI ``response_format`` knob, so node conformance here
+        relies on the prompt rules and the downstream schema validator, not on a
+        provider-enforced output shape.
+        """
         role = _NEXUS_ROLE_FOR_NODE.get(node_role, self.role)
         lane = self.lane
         if node_role is NodeRole.INDEPENDENT_VERIFIER:
             lane = os.environ.get("SECHELIX_NEXUS_VERIFIER_LANE") or None
         return self._invoke(prompt, timeout=timeout, role=role, lane=lane)
 
-    def invoke(self, prompt: str, *, timeout: float = 300.0) -> ProviderResult:
+    def invoke(
+        self,
+        prompt: str,
+        *,
+        timeout: float = 300.0,
+        response_schema: dict[str, Any] | None = None,
+    ) -> ProviderResult:
         return self._invoke(prompt, timeout=timeout, role=self.role, lane=self.lane)
 
     def _invoke(

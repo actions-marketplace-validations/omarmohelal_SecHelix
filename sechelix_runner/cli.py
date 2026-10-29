@@ -147,6 +147,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "claude-code": bool(shutil.which("claude")),
             "gemini-cli": bool(shutil.which("gemini")),
             "nexus": bool(shutil.which("nexus")),
+            "openrouter": bool(os.environ.get("SECHELIX_OPENROUTER_API_KEY")),
+            "wasm-gateway": bool(os.environ.get("SECHELIX_WASM_API_KEY")),
         },
         "redaction": "enabled",
         "core_contracts": _core_available(),
@@ -215,6 +217,30 @@ def _build_executor(args: argparse.Namespace):
         return ReasoningExecutor(
             provider, timeout=float(args.node_timeout or 900.0)
         )
+    if choice == "openrouter":
+        from .providers.openrouter import KEY_ENV, OpenRouterExecutor
+        from .providers.reasoning import ReasoningExecutor
+
+        provider = OpenRouterExecutor(model=getattr(args, "model", None))
+        if not provider.available:
+            raise RuntimeError(
+      f"{KEY_ENV} not set; export an OpenRouter key or use --executor none"
+            )
+        return ReasoningExecutor(
+            provider, timeout=float(args.node_timeout or 300.0)
+        )
+    if choice == "wasm-gateway":
+        from .providers.wasm_gateway import KEY_ENV, WasmGatewayExecutor
+        from .providers.reasoning import ReasoningExecutor
+
+        provider = WasmGatewayExecutor(model=getattr(args, "model", None))
+        if not provider.available:
+            raise RuntimeError(
+      f"{KEY_ENV} not set; export a wasm gateway key or use --executor none"
+            )
+        return ReasoningExecutor(
+            provider, timeout=float(args.node_timeout or 300.0)
+        )
     raise RuntimeError(f"unknown executor: {choice}")
 
 def _checkpoint_run_args(
@@ -250,6 +276,21 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
     target = describe_target(root)
     world = build_world(root, depth=args.depth)
+
+    seed_path = getattr(args, "seed_candidates", None)
+    if seed_path:
+        from .candidate_seed import SeedError, load_seed_candidates
+
+        try:
+            seeded = load_seed_candidates(seed_path)
+        except SeedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        # Scanner candidates join any the run produces; the verify node then
+        # treats them exactly like a model-hunted candidate -- it must try to
+        # disprove each one, not trust the scanner that raised it.
+        world["candidates"] = list(world.get("candidates") or []) + seeded
+
     graph = _default_graph(world)
 
     limits = BudgetLimits(
@@ -758,10 +799,17 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--max-seconds", type=float, default=None, dest="max_seconds")
     audit.add_argument("--max-nodes", type=int, default=None, dest="max_nodes")
     audit.add_argument(
-        "--executor", choices=("none", "claude-code", "gemini-cli", "nexus"), default="none",
+        "--executor",
+        choices=("none", "claude-code", "gemini-cli", "nexus", "openrouter", "wasm-gateway"),
+        default="none",
         help="reasoning executor; 'none' orchestrates without analysing code",
     )
     audit.add_argument("--model", default=None, help="provider model override")
+    audit.add_argument(
+        "--seed-candidates", default=None, dest="seed_candidates", metavar="FILE",
+        help="normalized scanner report (adapters.cli output); its candidates are "
+             "routed through the independent verifier, not trusted as findings",
+    )
     audit.add_argument(
         "--node-timeout", type=float, default=None, dest="node_timeout",
         help="seconds allowed per reasoning node (default 300, 900 for gemini-cli)",
