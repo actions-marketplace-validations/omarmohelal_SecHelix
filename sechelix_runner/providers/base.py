@@ -52,6 +52,82 @@ NODE_OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 
+#: Independent verification has a different contract from discovery. A verifier
+#: classifies every candidate it was given; it does not emit another hunter-style
+#: candidate list and it never creates a canonical finding-v1 object by itself.
+VERIFIER_CLASSIFICATIONS = frozenset(
+    {
+        "VERIFIED",
+        "LIKELY_BUT_UNPROVEN",
+        "FALSE_POSITIVE",
+        "DUPLICATE_ROOT_CAUSE",
+        "BLOCKED_BY_ENVIRONMENT",
+    }
+)
+
+VERIFIER_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["assessments"],
+    "properties": {
+        "assessments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": [
+                    "candidate_ref",
+                    "classification",
+                    "claim",
+                    "location",
+                    "why",
+                    "refutation_attempt",
+                ],
+                "properties": {
+                    "candidate_ref": {"type": "string", "minLength": 1},
+                    "classification": {"enum": sorted(VERIFIER_CLASSIFICATIONS)},
+                    "claim": {"type": "string", "minLength": 1},
+                    "location": {"type": "string", "minLength": 1},
+                    "why": {"type": "string", "minLength": 1},
+                    "refutation_attempt": {"type": "string", "minLength": 1},
+                    "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                    "hypothesis_ids": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "notes": {"type": "string"},
+        "examined": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
+def strictify(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``schema`` tightened for OpenAI-style strict structured output.
+
+    Strict ``json_schema`` response formats require every object to set
+    ``additionalProperties: false`` and to list *all* of its properties as
+    ``required``. SecHelix's schemas intentionally leave some fields optional, so
+    this derives a strict-compatible shape from them without editing the canonical
+    schema: a model is forced to emit every field (optional ones simply come back
+    empty), which still validates against the more lenient hand-rolled checks.
+
+    The original is not mutated.
+    """
+    import copy
+
+    def walk(node: Any) -> Any:
+        if not isinstance(node, dict):
+            return node
+        if node.get("type") == "object" and isinstance(node.get("properties"), dict):
+            node["additionalProperties"] = False
+            node["required"] = list(node["properties"].keys())
+            for value in node["properties"].values():
+                walk(value)
+        if node.get("type") == "array" and isinstance(node.get("items"), dict):
+            walk(node["items"])
+        return node
+
+    return walk(copy.deepcopy(schema))
+
+
 class ProviderError(RuntimeError):
     """The provider could not be used, or returned something unusable."""
 
@@ -75,8 +151,21 @@ class ProviderExecutor(Protocol):
 
     name: str
 
-    def invoke(self, prompt: str, *, timeout: float) -> ProviderResult:
-        """Run one isolated request. No memory of any previous call."""
+    def invoke(
+        self,
+        prompt: str,
+        *,
+        timeout: float,
+        response_schema: dict[str, Any] | None = None,
+    ) -> ProviderResult:
+        """Run one isolated request. No memory of any previous call.
+
+        ``response_schema`` is an optional JSON schema the node expects back. A
+        provider that can constrain output to it (an HTTP gateway with structured
+        outputs) should; one that cannot (a local agent CLI that is already told
+        the shape in the prompt) ignores it. Enforcing it never weakens the
+        downstream schema check -- it only makes a conforming response more likely.
+        """
         ...
 
 
@@ -152,4 +241,81 @@ def validate_node_output(payload: Any) -> list[str]:
         ids = candidate.get("hypothesis_ids", [])
         if ids is not None and not isinstance(ids, list):
             problems.append(f"{where}.hypothesis_ids: must be a list")
+    return problems
+
+
+def validate_verifier_output(payload: Any) -> list[str]:
+    """Validate the typed independent-verifier handoff.
+
+    VERIFIED here is a verifier classification only. This validator does not
+    manufacture the severity, evidence chain, resolution, or other fields a
+    canonical finding-v1 record requires.
+    """
+
+    problems: list[str] = []
+    if not isinstance(payload, dict):
+        return [f"expected an object, got {type(payload).__name__}"]
+    assessments = payload.get("assessments")
+    if assessments is None:
+        return ["missing required field 'assessments'"]
+    if not isinstance(assessments, list):
+        return [f"'assessments' must be a list, got {type(assessments).__name__}"]
+
+    seen_refs: set[str] = set()
+    for index, assessment in enumerate(assessments):
+        where = f"assessments[{index}]"
+        if not isinstance(assessment, dict):
+            problems.append(f"{where}: expected an object")
+            continue
+
+        for required in (
+            "candidate_ref",
+            "claim",
+            "location",
+            "why",
+            "refutation_attempt",
+        ):
+            value = assessment.get(required)
+            if not isinstance(value, str) or not value.strip():
+                problems.append(f"{where}.{required}: missing or empty")
+
+        candidate_ref = assessment.get("candidate_ref")
+        if isinstance(candidate_ref, str) and candidate_ref.strip():
+            raw_digest = (
+                candidate_ref.removeprefix("sha256:")
+                if candidate_ref.startswith("sha256:")
+                else ""
+            )
+            if (
+                len(raw_digest) != 64
+                or any(char not in "0123456789abcdef" for char in raw_digest)
+            ):
+                problems.append(
+                    f"{where}.candidate_ref: must be a canonical sha256 digest"
+                )
+            if candidate_ref in seen_refs:
+                problems.append(f"{where}.candidate_ref: duplicate {candidate_ref!r}")
+            seen_refs.add(candidate_ref)
+
+        classification = assessment.get("classification")
+        if classification not in VERIFIER_CLASSIFICATIONS:
+            problems.append(
+                f"{where}.classification: must be one of "
+                f"{sorted(VERIFIER_CLASSIFICATIONS)}"
+            )
+
+        for field in ("evidence_ids", "hypothesis_ids"):
+            values = assessment.get(field, [])
+            if values is not None and not isinstance(values, list):
+                problems.append(f"{where}.{field}: must be a list")
+            elif isinstance(values, list) and any(
+                not isinstance(item, str) or not item.strip() for item in values
+            ):
+                problems.append(f"{where}.{field}: entries must be non-empty strings")
+
+        if classification == "VERIFIED" and not assessment.get("evidence_ids"):
+            problems.append(
+                f"{where}.evidence_ids: VERIFIED requires stable supporting evidence"
+            )
+
     return problems

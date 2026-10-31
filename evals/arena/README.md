@@ -31,6 +31,183 @@ Freeze predictions before revealing truth. Record exact tool version/commit, hos
 
 Do not let the evaluated session read `evals/fixtures/`, the fixture builder, Gold Pack answers, or any ground-truth material before predictions are fixed.
 
+## 3.1 Build SecHelix operational run telemetry
+
+For a SecHelix participant, convert the completed `RunResult.to_dict()`
+artifact into Arena-compatible run metadata instead of manually adding cost,
+token and verifier/gate fields:
+
+```bash
+python evals/arena_run.py \
+  --run work/arena-run.json \
+  --agent-host isolated-eval-host \
+  --output work/arena-run.json
+```
+
+The helper records wall-clock elapsed time, per-status node counts, provider and
+model sets, aggregate tokens/cost when those measurements are complete, and the
+actual `INDEPENDENT_VERIFIER` / `RELEASE_GATE` node records. Missing telemetry
+is `NOT_MEASURED`, never zero. Nodes that were blocked or skipped without
+provider execution do not create fake token/cost gaps.
+
+It also binds the generated metadata to the source run artifact with SHA-256.
+This is operational telemetry only: it does not score whether the verifier or
+gate was *correct*. That remains the job of the independent Arena assessment.
+
+## 3.2 Bind the persisted SecHelix workspace
+
+For an actual SecHelix run, the evaluator can also bind the persisted run
+workspace before scoring verifier/gate behavior:
+
+```bash
+python evals/arena_workspace.py \
+  --root . \
+  --run-id RUN-EXAMPLE \
+  --output work/arena-workspace-evidence.json
+```
+
+The helper first verifies the workspace `manifest.json`. Any changed, missing,
+or unmanifested file is a hard failure. It then emits SHA-256 identities for
+`run.json`, `graph.json`, `replay/outcomes.json`, and `manifest.json`, plus
+digest-only summaries for independent-verifier, release-gate, remediator and
+patch-verifier nodes.
+
+Node output bodies are not copied into the index. The evaluator still opens the
+original redacted workspace artifacts when assessing correctness; the index only
+proves exactly which bytes and role outputs the assessment references.
+
+## 3.3 Bind run telemetry to manifest-verified workspace evidence
+
+Before an independent evaluator scores verifier or release-gate correctness,
+build one fail-closed measurement bundle that proves the operational run record
+and workspace evidence refer to the same SecHelix run:
+
+```bash
+python evals/arena_measurement_bundle.py \
+  --run work/run.json \
+  --workspace-root . \
+  --run-id RUN-EXAMPLE \
+  --agent-host isolated-eval-host \
+  --output work/measurement-bundle.json
+```
+
+The helper builds Arena operational telemetry, verifies the persisted workspace
+manifest, requires both `INDEPENDENT_VERIFIER` and `RELEASE_GATE` evidence,
+and refuses mismatched run ID, target commit, scope, or graph digest. The output
+contains only operational telemetry, artifact digests and digest-only role
+evidence targets.
+
+
+
+For production-like LOCAL fixture cases, add `fixture_binding_path` to the
+corresponding run-map row. The batch builder verifies that the binding uses the
+same run ID, target commit, scope, graph digest, and canonical run-payload digest
+as the manifest-verified Arena bundle, then carries only the fixture tier and
+stable binding/result digests into the blind packet handoff. This makes the
+fixture/run association part of the handoff digest that is frozen before truth
+reveal.
+
+`READY_FOR_INDEPENDENT_ASSESSMENT` is not a security score. The bundle
+explicitly leaves correctness unscored; an independent evaluator must still
+produce the evidence-backed assessment described below.
+
+## 3.4 Build a complete manifest-verified batch handoff
+
+When each blind case has its own SecHelix run workspace, bind the full prepared
+packet before an evaluator starts scoring:
+
+```bash
+python evals/arena_batch.py \
+  --manifest work/arena-prepared.json \
+  --run-map work/run-map.json \
+  --base-dir work \
+  --output work/arena-batch-handoff.json
+```
+
+The batch handoff requires every prepared CASE- identifier exactly once and
+requires each case workspace to pass manifest verification plus measurement
+bundle validation. It also emits a packet-wide operational summary: summed and
+per-case wall time, earliest-start to latest-finish packet span, tokens and cost
+with explicit completeness, plus observed host/provider/model labels. Missing
+provider telemetry remains `NOT_MEASURED`; runs with no applicable provider
+work remain `NOT_APPLICABLE`.
+
+Summed case elapsed time is deliberately separate from packet span because
+concurrent cases can overlap. These are operational measurements only. The
+handoff still contains no workflow correctness score.
+
+## 3.5 Freeze the complete prediction batch before truth reveal
+
+After the complete manifest-verified batch handoff exists, create a deterministic
+prediction-freeze record **before** any evaluator opens blind truth:
+
+```bash
+python evals/arena_freeze.py freeze \
+  --manifest work/arena-prepared.json \
+  --handoff work/arena-batch-handoff.json \
+  --frozen-at 2026-09-26T19:00:00Z \
+  --recorder-identity "Independent Eval Operator" \
+  --recorder-role prediction-custodian \
+  --output work/prediction-freeze.json
+```
+
+The freeze validates the handoff digest, every case bundle digest, packet
+identity, participant identity and complete opaque case set. Its
+`prediction_digest` is derived only from each case ID, run ID and
+manifest-verified bundle digest. Ground truth is not an input and is not emitted.
+
+After truth is actually revealed, build Arena blindness metadata from that exact
+freeze:
+
+```bash
+python evals/arena_freeze.py blindness \
+  --freeze work/prediction-freeze.json \
+  --ground-truth-digest sha256:<digest> \
+  --truth-revealed-at 2026-09-26T19:05:00Z \
+  --evaluator-independent true \
+  --contamination UNCONTAMINATED \
+  --output work/blindness.json
+```
+
+The reveal timestamp must be strictly later than the prediction freeze.
+This helper checks consistency and ordering but cannot prove that the supplied
+timestamps, contamination claim or evaluator-independence claim are true. Arena
+still requires attributable independent-assessor metadata before a result can be
+published as measured.
+
+## 3.6 Bind independent judgments to the verified batch
+
+After predictions are frozen and the independent evaluator has made explicit
+workflow judgments, bind those judgments to the exact manifest-verified bytes
+for each case:
+
+```bash
+python evals/arena_batch_assessor.py \
+  --handoff work/arena-batch-handoff.json \
+  --spec work/assessment-spec.json \
+  --base-dir work \
+  --prediction-freeze work/prediction-freeze.json \
+  --blindness work/blindness.json \
+  --output work/assessment.json
+```
+
+Each scored judgment must cite an `artifact_ref` that already exists in that
+case's measurement-bundle `workspace_artifacts` map plus a relative local path
+to the same file. The builder re-hashes the file and rejects digest drift,
+unmanifested artifacts, path escapes, duplicate/missing cases, or a spec bound to
+another handoff/packet.
+
+The resulting assessment carries a fail-closed protocol seal binding those
+judgments to the exact batch handoff, prediction freeze and post-freeze
+blindness/ground-truth record. A batch assessment without that seal remains
+usable for inspection, but Arena finalization keeps it **NOT_MEASURED** and
+ineligible for publication. The seal also prevents a valid assessment from
+being replayed against another handoff, freeze or truth-reveal record.
+
+This step does **not** decide correctness or establish evaluator independence;
+it proves which verified run bytes each assessor-supplied judgment cites and
+which exact freeze/reveal chain those judgments belong to.
+
 ## 4. Independent workflow assessment
 
 An evaluator that did not produce the predictions records applicable observations with these fields:
@@ -42,7 +219,29 @@ An evaluator that did not produce the predictions records applicable observation
 - `regression_proof`: boolean or `NOT_APPLICABLE`
 - `release_gate`: boolean or `NOT_APPLICABLE`
 
-A boolean means whether that workflow decision matched the independently established expected result. `NOT_APPLICABLE` is excluded from the denominator; it is never converted to success.
+A boolean means whether that workflow decision matched the independently established expected result. Every boolean must also carry an `evidence.<metric>` record with a short basis, one or more stable artifact references, and a SHA-256 digest binding the cited evidence bundle. `NOT_APPLICABLE` is excluded from the denominator and does not require invented evidence.
+
+### Build an evidence-backed assessment packet
+
+`evals/arena_packets.py` helps an independent evaluator bind each explicit
+judgment to local run artifacts without copying artifact contents or local paths
+into the assessment JSON.
+
+The packet spec still contains the evaluator's own boolean/NOT_APPLICABLE
+judgments and human-readable basis. The helper does **not** infer correctness,
+establish independence, or reveal blind truth. For each scored judgment it hashes
+the referenced files inside a caller-chosen base directory, emits only stable
+refs plus one canonical bundle digest, and rejects missing files, duplicate refs,
+and path escapes.
+
+```bash
+python evals/arena_packets.py \
+  --spec work/assessment-spec.json \
+  --base-dir work/run-artifacts \
+  --output work/assessment.json
+```
+
+The resulting `assessment.json` is passed to `arena.py finalize` below.
 
 ## 5. Finalize
 
@@ -51,14 +250,47 @@ python evals/arena.py finalize \
   --manifest work/arena-prepared.json \
   --run work/run.json \
   --blindness work/blindness.json \
+  --prediction-freeze work/prediction-freeze.json \
   --assessment work/assessment.json \
   --output work/arena-result.json
 ```
 
-The result stays **NOT_MEASURED** unless all required run metadata exists, the evaluator is independently identified, contamination is explicitly `UNCONTAMINATED`, truth was sealed until after predictions, prediction and truth digests are present, and every full-workflow metric has at least one applicable assessed observation.
+The result stays **NOT_MEASURED** unless all required run metadata exists, the evaluator is independently identified, contamination is explicitly `UNCONTAMINATED`, truth was sealed until after predictions, prediction and truth digests are present, every scored workflow judgment is evidence-backed, and every full-workflow metric has at least one applicable assessed observation.
+
+Finalization also validates the supplied prediction-freeze artifact itself. The blindness record must use the exact freeze digest, prediction digest, and freeze timestamp; its truth-reveal timestamp must be timezone-aware and strictly later. The freeze must be bound to the same prepared packet and participant. For manifest-verified batch assessments, finalization additionally requires the assessment protocol seal to match the exact handoff digest, freeze/prediction digests, blindness digest, ground-truth digest, participant digest, case identity set and assessment payload digest. A manually constructed or replayed chain remains `NOT_MEASURED`.
 
 ## Comparison rule
 
 `arena.comparable(left, right)` only permits an apples-to-apples comparison when both records are `MEASURED`, use the same blind packet, have the same participant category, and declare the same capability scope.
 
 This intentionally prevents a narrow scanner from winning by skipping work and prevents a broad workflow from being penalized for capabilities another participant never attempted.
+
+## 3.0 Bind a production-like LOCAL fixture to the full workflow
+
+Before building the normal manifest-verified Arena measurement bundle for a
+STATEFUL_APPLICATION or COMPOSITE_APPLICATION case, bind the fixture self-test
+to the exact completed SecHelix run:
+
+```bash
+python evals/arena_fixture_run_binding.py \
+  --fixture-result work/fixture-result.json \
+  --run work/run.json \
+  --expected-tier STATEFUL_APPLICATION \
+  --output work/fixture-run-binding.json
+```
+
+The binder is fail-closed. The fixture must have passed every contract check,
+remain literal-loopback only, and retain the explicit
+`production_effectiveness_established=false` /
+`arena_full_workflow_measured=false` disclaimers. The run must have no failed,
+blocked, or unsatisfied mandatory nodes and must contain the exact successful
+dependency chain `INDEPENDENT_VERIFIER → REMEDIATOR → PATCH_VERIFIER →
+RELEASE_GATE`. PATCH_VERIFIER must carry runtime independent-verification
+evidence.
+
+A READY binding is still `NOT_MEASURED`. It reads no blind truth, scores no
+correctness, and does not establish evaluator independence. Continue with the
+manifest-verified measurement/batch handoff, freeze the complete prediction
+packet before truth reveal, and use an independent assessor for the actual Arena
+judgments.
+

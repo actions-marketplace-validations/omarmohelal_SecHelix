@@ -38,8 +38,8 @@ from .graph import GraphNode, ReasonerGraph
 from .replay import ReplayError, replay_run
 from .report import RENDERERS
 from .roles import NodeRole, NodeStatus
-from .runner import Runner
-from .storage import InvalidRunId, RunWorkspace, list_runs, persist_run
+from .runner import Runner, new_run_id
+from .storage import InvalidRunId, RunWorkspace, list_runs, persist_run, redact
 from .world import DEPTHS, build_world, describe_target
 
 EXIT_OK = 0
@@ -146,6 +146,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "available_reasoning_executors": {
             "claude-code": bool(shutil.which("claude")),
             "gemini-cli": bool(shutil.which("gemini")),
+            "nexus": bool(shutil.which("nexus")),
+            "openrouter": bool(os.environ.get("SECHELIX_OPENROUTER_API_KEY")),
+            "wasm-gateway": bool(os.environ.get("SECHELIX_WASM_API_KEY")),
         },
         "redaction": "enabled",
         "core_contracts": _core_available(),
@@ -202,7 +205,68 @@ def _build_executor(args: argparse.Namespace):
         # will try first, so its default is generous rather than shared.
         default_timeout = 900.0 if args.node_timeout is None else float(args.node_timeout)
         return ReasoningExecutor(provider, timeout=default_timeout)
+    if choice == "nexus":
+        from .providers.nexus_cli import NexusCliExecutor
+        from .providers.reasoning import ReasoningExecutor
+
+        provider = NexusCliExecutor(lane=getattr(args, "model", None))
+        if not provider.available:
+            raise RuntimeError(
+                "nexus CLI not found on PATH; install/link Nexus or use another executor"
+            )
+        return ReasoningExecutor(
+            provider, timeout=float(args.node_timeout or 900.0)
+        )
+    if choice == "openrouter":
+        from .providers.openrouter import KEY_ENV, OpenRouterExecutor
+        from .providers.reasoning import ReasoningExecutor
+
+        provider = OpenRouterExecutor(model=getattr(args, "model", None))
+        if not provider.available:
+            raise RuntimeError(
+      f"{KEY_ENV} not set; export an OpenRouter key or use --executor none"
+            )
+        return ReasoningExecutor(
+            provider, timeout=float(args.node_timeout or 300.0)
+        )
+    if choice == "wasm-gateway":
+        from .providers.wasm_gateway import KEY_ENV, WasmGatewayExecutor
+        from .providers.reasoning import ReasoningExecutor
+
+        provider = WasmGatewayExecutor(model=getattr(args, "model", None))
+        if not provider.available:
+            raise RuntimeError(
+      f"{KEY_ENV} not set; export a wasm gateway key or use --executor none"
+            )
+        return ReasoningExecutor(
+            provider, timeout=float(args.node_timeout or 300.0)
+        )
     raise RuntimeError(f"unknown executor: {choice}")
+
+def _checkpoint_run_args(
+    root: Path, args: argparse.Namespace
+) -> tuple[str | None, Path, Path | None]:
+    """Resolve automatic durable checkpoint paths for audit-style commands."""
+
+    resume = getattr(args, "resume_from", None)
+    explicit = getattr(args, "checkpoint", None)
+    if resume is not None:
+        resume_path = Path(resume).expanduser().resolve()
+        checkpoint_path = (
+            Path(explicit).expanduser().resolve()
+            if explicit is not None
+            else resume_path
+        )
+        return None, checkpoint_path, resume_path
+
+    run_id = new_run_id()
+    checkpoint_path = (
+        Path(explicit).expanduser().resolve()
+        if explicit is not None
+        else root / ".sechelix" / "checkpoints" / f"{run_id}.json"
+    )
+    return run_id, checkpoint_path, None
+
 
 def cmd_audit(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
@@ -212,6 +276,21 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
     target = describe_target(root)
     world = build_world(root, depth=args.depth)
+
+    seed_path = getattr(args, "seed_candidates", None)
+    if seed_path:
+        from .candidate_seed import SeedError, load_seed_candidates
+
+        try:
+            seeded = load_seed_candidates(seed_path)
+        except SeedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        # Scanner candidates join any the run produces; the verify node then
+        # treats them exactly like a model-hunted candidate -- it must try to
+        # disprove each one, not trust the scanner that raised it.
+        world["candidates"] = list(world.get("candidates") or []) + seeded
+
     graph = _default_graph(world)
 
     limits = BudgetLimits(
@@ -225,12 +304,19 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
+    run_id, checkpoint_path, resume_from = _checkpoint_run_args(root, args)
     result = Runner(
         executor=executor,
         budget=BudgetGovernor(limits),
         target_commit=target["commit"],
         scope_id=target["scope_id"],
-    ).run(graph, world)
+    ).run(
+        graph,
+        world,
+        run_id=run_id,
+        checkpoint_path=checkpoint_path,
+        resume_from=resume_from,
+    )
 
     workspace = persist_run(root, result, graph)
 
@@ -260,12 +346,109 @@ def cmd_audit(args: argparse.Namespace) -> int:
     if args.json:
         payload = result.to_dict()
         payload["coverage"] = coverage_report
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        # stdout is often a CI log and must have the same default secrecy
+        # guarantees as the persisted run workspace. Replay reads the persisted
+        # artifacts directly, so redacting this presentation copy does not alter
+        # replay fidelity.
+        print(json.dumps(redact(payload), indent=2, sort_keys=True))
     else:
         _print_run(result, workspace)
         blind = coverage_report["blind_spots"]
         print(f"blind   {len(blind)} item(s) never covered or stale")
     return EXIT_OK if not result.unsatisfied_mandatory else EXIT_NOT_CLEAN
+
+
+def cmd_launch_audit(args: argparse.Namespace) -> int:
+    """Run evidence-routed AI-built-app launch checks 19-36.
+
+    The command deliberately reports CANDIDATE / ASSESSED_NO_CANDIDATE /
+    UNKNOWN / BLOCKED / FAILED.  It never turns "nothing found" into PASS.
+    """
+
+    from .launch_profile import (
+        LaunchContextBuilder,
+        build_launch_graph,
+        load_launch_checks,
+        summarize_launch_run,
+    )
+
+    root = Path(args.path).resolve()
+    if not root.is_dir():
+        print(f"error: {root} is not a directory", file=sys.stderr)
+        return EXIT_USAGE
+
+    checks = load_launch_checks()
+    if args.check:
+        wanted = {f"LAUNCH-{number}" for number in args.check}
+        checks = tuple(check for check in checks if check.id in wanted)
+    if not checks:
+        print("error: no launch checks selected", file=sys.stderr)
+        return EXIT_USAGE
+
+    target = describe_target(root)
+    world = build_world(root, depth=args.depth)
+    # These keys make absence explicit so the verifier/gate cannot confuse a
+    # missing collection with a clean one.
+    world.setdefault("candidates", [])
+    world.setdefault("findings", [])
+    graph = build_launch_graph(checks)
+
+    limits = BudgetLimits(
+        max_cost_usd=args.max_cost,
+        max_duration_seconds=args.max_seconds,
+        max_nodes=args.max_nodes,
+    )
+    try:
+        executor = _build_executor(args)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    run_id, checkpoint_path, resume_from = _checkpoint_run_args(root, args)
+    result = Runner(
+        executor=executor,
+        budget=BudgetGovernor(limits),
+        target_commit=target["commit"],
+        scope_id=target["scope_id"],
+        context_builder_factory=lambda run_world: LaunchContextBuilder(run_world, checks),
+    ).run(
+        graph,
+        world,
+        run_id=run_id,
+        checkpoint_path=checkpoint_path,
+        resume_from=resume_from,
+    )
+
+    workspace = persist_run(root, result, graph)
+    summary = summarize_launch_run(result, checks)
+    summary["run_id"] = result.run_id
+    summary["target_commit"] = result.target_commit
+    summary["unsatisfied_mandatory"] = list(result.unsatisfied_mandatory)
+    workspace.write_json("launch-checks.json", summary)
+    workspace.write_manifest()
+
+    if args.json:
+        print(json.dumps(redact(summary), indent=2, sort_keys=True))
+    else:
+        print(f"launch  {result.run_id}")
+        print(f"commit  {result.target_commit}")
+        for row in summary["checks"]:
+            print(
+                f"  {row['number']:>2}  {row['execution_state']:<22} "
+                f"{row['title']}"
+            )
+        print()
+        print("note    ASSESSED_NO_CANDIDATE is not PASS; release evidence is separate.")
+        print(f"saved   {workspace.path}")
+
+    unresolved = {
+        "CANDIDATE",
+        "UNKNOWN",
+        "BLOCKED",
+        "FAILED",
+    }
+    states = {str(row["execution_state"]) for row in summary["checks"]}
+    return EXIT_NOT_CLEAN if states & unresolved else EXIT_OK
 
 
 def _print_run(result: Any, workspace: RunWorkspace) -> None:
@@ -383,6 +566,213 @@ def cmd_report(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_scout(args: argparse.Namespace) -> int:
+    """Run one bounded static evidence capability over a repository."""
+
+    from .pentest.static_tools import StaticSecurityRunner, StaticToolError
+
+    root = Path(args.path).resolve()
+    if not root.is_dir():
+        print(f"error: {root} is not a directory", file=sys.stderr)
+        return EXIT_USAGE
+    workspace = root / ".sechelix" / "scout"
+    runner = StaticSecurityRunner(root, workspace)
+    capabilities = {
+        "session-token-trust": runner.session_token_trust,
+        "semgrep": runner.semgrep,
+        "gitleaks": runner.gitleaks,
+        "trivy": runner.trivy,
+    }
+    try:
+        result = capabilities[args.capability]()
+    except StaticToolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    payload = {
+        "capability": result.tool,
+        "candidate_count": len(result.candidates),
+        "report_path": result.report_path,
+        "status": "CANDIDATE_ONLY",
+        "assessment": "UNASSESSED",
+    }
+    if args.json:
+        payload["candidates"] = list(result.candidates)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"scout   {result.tool}")
+        print(f"signals {len(result.candidates)} candidate(s)")
+        print("status  CANDIDATE_ONLY / UNASSESSED")
+        print(f"report  {result.report_path}")
+        print("note    scanner signals are not SecHelix findings")
+    return EXIT_OK
+
+
+
+def _load_json_object(path: str, *, label: str) -> dict[str, Any]:
+    source = Path(path).resolve()
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not readable JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must contain a JSON object")
+    return payload
+
+
+def _load_stage_result(path: str, *, expected_name: str):
+    from sechelix_core.remediation import FAIL, NOT_RUN, PASS, StageResult
+
+    payload = _load_json_object(path, label=expected_name)
+    stage = str(payload.get("stage", "")).strip()
+    status = str(payload.get("status", "")).strip().upper()
+    if stage != expected_name:
+        raise ValueError(
+            f"{expected_name} evidence declares stage {stage!r}; expected {expected_name!r}"
+        )
+    if status not in {PASS, FAIL, NOT_RUN}:
+        raise ValueError(
+            f"{expected_name} status must be PASS, FAIL, or NOT_RUN"
+        )
+    evidence_ids_raw = payload.get("evidence_ids") or []
+    if not isinstance(evidence_ids_raw, list) or not all(
+        isinstance(item, str) and item.strip() for item in evidence_ids_raw
+    ):
+        raise ValueError(f"{expected_name} evidence_ids must be a list of strings")
+    return StageResult(
+        expected_name,
+        status,
+        str(payload.get("detail", "")),
+        tuple(evidence_ids_raw),
+    )
+
+
+def cmd_fix_check(args: argparse.Namespace) -> int:
+    """Execute the bounded remediation gates that SecHelix can prove locally.
+
+    The command never applies a patch. It operates only on an explicit scratch
+    workspace, runs fixed-shape named tests in the network-disabled sandbox, and
+    combines them with separately supplied differential-review / independent-
+    verification evidence. READY_FOR_REVIEW still means human review is required.
+    """
+
+    from sechelix_core.remediation import VERIFIED, run_loop
+    from .remediation_exec import (
+        NamedTestSpec,
+        RemediationCheckRunner,
+        RemediationExecutionError,
+    )
+
+    workspace = Path(args.workspace).resolve()
+    if workspace == Path.cwd().resolve():
+        print(
+            "error: --workspace must be a separate scratch workspace, not the current working tree",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    try:
+        runner = RemediationCheckRunner(workspace)
+        existing = None
+        if args.existing_test:
+            existing = runner.run_test(
+                "existing_tests",
+                NamedTestSpec(
+                    "python-unittest",
+                    tuple(args.existing_test),
+                    args.timeout,
+                ),
+            ).stage
+
+        regression = None
+        if args.regression_test:
+            regression = runner.run_test(
+                "vulnerability_regression",
+                NamedTestSpec(
+                    "python-unittest",
+                    tuple(args.regression_test),
+                    args.timeout,
+                ),
+            ).stage
+
+        patch_review = (
+            _load_json_object(args.patch_review, label="patch review")
+            if args.patch_review
+            else None
+        )
+        independent = (
+            _load_stage_result(
+                args.independent_verification,
+                expected_name="independent_verification",
+            )
+            if args.independent_verification
+            else None
+        )
+        result = run_loop(
+            {"finding_id": args.finding_id, "status": VERIFIED},
+            workspace=str(workspace),
+            existing_tests=existing,
+            vulnerability_regression=regression,
+            patch_diff_review=patch_review,
+            independent_verification=independent,
+        )
+    except (RemediationExecutionError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    payload = result.as_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"fix-check {result.finding_id}")
+        print(f"  outcome    {result.outcome}")
+        print(f"  workspace  {result.workspace}")
+        for stage in result.stages:
+            print(f"  {stage.name:26} {stage.status:8} {stage.detail}")
+        if result.blocked_at:
+            print(f"  blocked at {result.blocked_at}")
+        print("  applied    false (human review required)")
+    return EXIT_OK if result.ready else EXIT_NOT_CLEAN
+
+
+def cmd_benchmark_models(args: argparse.Namespace) -> int:
+    """Generate a blind prediction packet for one Nexus lane.
+
+    This command deliberately does not score the packet. Ground truth stays
+    outside the model process and scoring remains a separate explicit step.
+    """
+
+    from .model_benchmark import (
+        ModelBenchmarkError,
+        run_nexus_benchmark,
+        write_prediction_packet,
+    )
+
+    try:
+        packet = run_nexus_benchmark(
+            cases_path=args.cases,
+            lane=args.lane,
+            sechelix_commit=args.sechelix_commit,
+            fixture_suite_version=args.fixture_suite_version,
+            timeout_per_case=args.timeout_per_case,
+        )
+        write_prediction_packet(args.output, packet)
+    except (ModelBenchmarkError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    if args.json:
+        print(json.dumps(packet, indent=2, sort_keys=True))
+    else:
+        print(f"benchmark lane   {args.lane}")
+        print(f"cases            {packet['case_count']}")
+        print(f"predictions      {args.output}")
+        print("scoring          NOT_RUN (freeze this packet, then score separately)")
+        print(f"cost             {packet['cost']}")
+        print(f"time_seconds     {packet['time_seconds']}")
+    return EXIT_OK
+
+
 # -- entry point -------------------------------------------------------------
 
 
@@ -409,16 +799,169 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--max-seconds", type=float, default=None, dest="max_seconds")
     audit.add_argument("--max-nodes", type=int, default=None, dest="max_nodes")
     audit.add_argument(
-        "--executor", choices=("none", "claude-code", "gemini-cli"), default="none",
+        "--executor",
+        choices=("none", "claude-code", "gemini-cli", "nexus", "openrouter", "wasm-gateway"),
+        default="none",
         help="reasoning executor; 'none' orchestrates without analysing code",
     )
     audit.add_argument("--model", default=None, help="provider model override")
     audit.add_argument(
+        "--seed-candidates", default=None, dest="seed_candidates", metavar="FILE",
+        help="normalized scanner report (adapters.cli output); its candidates are "
+             "routed through the independent verifier, not trusted as findings",
+    )
+    audit.add_argument(
         "--node-timeout", type=float, default=None, dest="node_timeout",
         help="seconds allowed per reasoning node (default 300, 900 for gemini-cli)",
     )
+    audit.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="checkpoint file override (default: .sechelix/checkpoints/RUN-....json)",
+    )
+    audit.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="resume remaining nodes from a sealed checkpoint after verifying target/scope/graph/input",
+    )
     _common(audit)
     audit.set_defaults(func=cmd_audit)
+
+    launch_audit = sub.add_parser(
+        "launch-audit",
+        help="run evidence-routed AI-built-app launch checks 19-36",
+    )
+    launch_audit.add_argument("path", nargs="?", default=".")
+    launch_audit.add_argument("--depth", choices=sorted(DEPTHS), default="standard")
+    launch_audit.add_argument(
+        "--check",
+        action="append",
+        choices=tuple(f"{number:02d}" for number in range(19, 37)),
+        default=[],
+        help="run only one launch check number; repeatable (default: 19-36)",
+    )
+    launch_audit.add_argument("--max-cost", type=float, default=None, dest="max_cost")
+    launch_audit.add_argument("--max-seconds", type=float, default=None, dest="max_seconds")
+    launch_audit.add_argument("--max-nodes", type=int, default=None, dest="max_nodes")
+    launch_audit.add_argument(
+        "--executor", choices=("none", "claude-code", "gemini-cli", "nexus"), default="none",
+        help="reasoning executor; 'none' records all reasoning checks as blocked",
+    )
+    launch_audit.add_argument("--model", default=None, help="provider model override")
+    launch_audit.add_argument(
+        "--node-timeout", type=float, default=None, dest="node_timeout",
+        help="seconds allowed per reasoning node",
+    )
+    launch_audit.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="checkpoint file override (default: .sechelix/checkpoints/RUN-....json)",
+    )
+    launch_audit.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="resume remaining launch checks from a sealed node-boundary checkpoint",
+    )
+    _common(launch_audit)
+    launch_audit.set_defaults(func=cmd_launch_audit)
+
+    scout = sub.add_parser(
+        "scout",
+        help="run one bounded static evidence capability; outputs candidates only",
+    )
+    scout.add_argument("path", nargs="?", default=".")
+    scout.add_argument(
+        "--capability",
+        choices=("session-token-trust", "semgrep", "gitleaks", "trivy"),
+        default="session-token-trust",
+    )
+    _common(scout)
+    scout.set_defaults(func=cmd_scout)
+
+    fix_check = sub.add_parser(
+        "fix-check",
+        help="run bounded remediation/retest gates in a separate scratch workspace",
+    )
+    fix_check.add_argument("finding_id", help="VERIFIED finding identifier being remediated")
+    fix_check.add_argument(
+        "--workspace",
+        required=True,
+        help="separate scratch workspace; the current working tree is refused",
+    )
+    fix_check.add_argument(
+        "--existing-test",
+        action="append",
+        default=[],
+        help="python unittest module/file target to run; repeatable",
+    )
+    fix_check.add_argument(
+        "--regression-test",
+        action="append",
+        default=[],
+        help="security regression unittest module/file target to run; repeatable",
+    )
+    fix_check.add_argument(
+        "--patch-review",
+        default=None,
+        help="JSON differential-review evidence; omission keeps the loop incomplete",
+    )
+    fix_check.add_argument(
+        "--independent-verification",
+        default=None,
+        help="JSON StageResult for independent_verification; omission keeps the loop incomplete",
+    )
+    fix_check.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="seconds allowed for each named test stage (1..900)",
+    )
+    _common(fix_check)
+    fix_check.set_defaults(func=cmd_fix_check)
+
+    benchmark_models = sub.add_parser(
+        "benchmark-models",
+        help="generate a sealed blind prediction packet for one Nexus lane",
+    )
+    benchmark_models.add_argument(
+        "--cases",
+        required=True,
+        type=Path,
+        help="sealed blind cases.json; ground truth must not be present",
+    )
+    benchmark_models.add_argument(
+        "--lane",
+        required=True,
+        help="exact Nexus lane/model route to evaluate",
+    )
+    benchmark_models.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="prediction packet path; score it only after this file is frozen",
+    )
+    benchmark_models.add_argument(
+        "--sechelix-commit",
+        required=True,
+        help="exact SecHelix commit associated with the sealed packet",
+    )
+    benchmark_models.add_argument(
+        "--fixture-suite-version",
+        required=True,
+        help="human-readable fixture suite/version label",
+    )
+    benchmark_models.add_argument(
+        "--timeout-per-case",
+        type=float,
+        default=300.0,
+        help="maximum seconds for each isolated model judgment",
+    )
+    _common(benchmark_models)
+    benchmark_models.set_defaults(func=cmd_benchmark_models)
 
     runs = sub.add_parser("runs", help="list recorded runs and their integrity")
     runs.add_argument("path", nargs="?", default=".")

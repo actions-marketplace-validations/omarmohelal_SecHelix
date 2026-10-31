@@ -68,6 +68,36 @@ After fixes, re-run the failed/unknown checks and produce the normal SecHelix re
 
 The 36-check launch profile is documented in [`references/ai-built-app-launch.md`](../references/ai-built-app-launch.md). It is a practical minimum launch filter over the larger SecHelix catalog, not a replacement for the full audit.
 
+Optional runtime execution for the image/checklist half (19-36):
+
+```bash
+# all checks 19-36
+sechelix launch-audit . --executor claude-code
+
+# targeted checks, for example XSS + IDOR/BOLA
+sechelix launch-audit . --check 19 --check 33 --executor claude-code
+```
+
+The runtime records `CANDIDATE`, `ASSESSED_NO_CANDIDATE`, `UNKNOWN`, `BLOCKED`, or `FAILED`. It intentionally does not emit `PASS`; a launch PASS still requires the canonical SecHelix evidence, independent-verification, remediation/retest, and release-gate contracts.
+
+### Resume an interrupted audit
+
+`audit` and `launch-audit` write a sealed checkpoint after every completed
+node. The default path is `.sechelix/checkpoints/<RUN-ID>.json`.
+
+```bash
+# resume remaining work with Nexus after a host/provider interruption
+sechelix audit . \
+  --resume-from .sechelix/checkpoints/RUN-0123456789ABCDEF.json \
+  --executor nexus
+```
+
+Completed nodes are not re-run. Their original model/provider/evidence records
+stay intact; only unfinished nodes use the new executor. Resume is refused if
+the checkpoint was edited or if target commit, scope, graph, caller input, or
+budget limits changed. This is interruption recovery, not a way to bypass a
+failed security check.
+
 ## SEO Audit
 
 ```text
@@ -222,6 +252,7 @@ pipx install sechelix
 | `sechelix coverage [path]` | Show blind spots from previous runs |
 | `sechelix report [run_id]` | Render a saved run |
 | `sechelix replay <run_id> [path]` | Replay a run offline and compare it with the recorded execution |
+| `sechelix fix-check <finding_id> --workspace <scratch>` | Run bounded remediation/retest gates without applying a patch |
 | `sechelix mcp [path]` | Serve the MCP adapter over stdio |
 
 ### Check the setup
@@ -292,6 +323,50 @@ sechelix report --help
 ```bash
 sechelix replay <run_id>
 ```
+
+### Run bounded remediation checks
+
+`fix-check` is the executable half of Fix Mode. It never applies a patch and
+refuses to use the current working tree as its scratch workspace. Test execution
+is fixed-shape Python `unittest` inside the network-disabled sandbox; there is
+no generic shell or argv passthrough.
+
+A partial run is useful and honest: omitted stages remain `NOT_RUN`, so the
+result is `INCOMPLETE` rather than a false pass.
+
+```bash
+sechelix fix-check SHX-F-1 \
+  --workspace /tmp/sechelix-fix-SHX-F-1 \
+  --existing-test tests.test_existing_behavior \
+  --regression-test tests.test_security_regression \
+  --json
+```
+
+To reach `READY_FOR_REVIEW`, also provide differential-review evidence and an
+independent-verification StageResult:
+
+```bash
+sechelix fix-check SHX-F-1 \
+  --workspace /tmp/sechelix-fix-SHX-F-1 \
+  --existing-test tests.test_existing_behavior \
+  --regression-test tests.test_security_regression \
+  --patch-review patch-review.json \
+  --independent-verification independent-verification.json
+```
+
+The independent-verification JSON must declare:
+
+```json
+{
+  "stage": "independent_verification",
+  "status": "PASS",
+  "detail": "independent verifier reconstructed the original claim and observed secure behavior",
+  "evidence_ids": ["EV-VERIFY-1"]
+}
+```
+
+`READY_FOR_REVIEW` still means a human-reviewed patch proposal. SecHelix does
+not apply or merge the change from this command.
 
 ### Start the MCP adapter
 

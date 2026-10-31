@@ -29,9 +29,16 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .budget import BudgetExceeded, BudgetGovernor, BudgetLimits
+from .checkpoint import (
+    CheckpointError,
+    RunnerCheckpoint,
+    load_checkpoint,
+    write_checkpoint,
+)
 from .context import ContextBuilder
 from .digests import digest
 from .executor import Executor, ExecutorError, NodeOutcome
@@ -68,6 +75,20 @@ class RoutingDecision:
             "reason": self.reason,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RoutingDecision":
+        try:
+            return cls(
+                node_id=str(data["node_id"]),
+                role=str(data["role"]),
+                included=bool(data["included"]),
+                reason=str(data["reason"]),
+            )
+        except KeyError as exc:
+            raise CheckpointError(
+                f"checkpoint routing decision is missing {exc.args[0]}"
+            ) from exc
+
 
 @dataclass
 class RunResult:
@@ -85,6 +106,9 @@ class RunResult:
     started_at: str = ""
     finished_at: str = ""
     executor_name: str = ""
+    #: Canonical VERIFIED finding-v1 records the run promoted, if any. Empty
+    #: unless a verifier/full-workflow node placed them in the world.
+    verified_findings: list[dict[str, Any]] = field(default_factory=list)
 
     # -- the questions the release gate asks --------------------------------
 
@@ -128,6 +152,7 @@ class RunResult:
             "unsatisfied_mandatory": self.unsatisfied_mandatory,
             "blocked": self.blocked,
             "failed": self.failed,
+            "verified_findings": list(self.verified_findings),
         }
 
     #: Populated by the runner so the properties above can see it without the
@@ -140,6 +165,90 @@ class RunResult:
 #: planner, and this only exists so an unconfigured run still reserves something
 #: rather than treating every node as free.
 DEFAULT_NODE_COST_USD = 0.0
+
+
+def _world_has_candidates(world: dict[str, Any]) -> bool:
+    """Whether the world holds at least one candidate finding to verify."""
+    candidates = world.get("candidates")
+    return isinstance(candidates, list) and len(candidates) > 0
+
+
+def _graph_digest(graph: ReasonerGraph) -> str:
+    return digest(
+        [
+            {
+                "node_id": n.node_id,
+                "role": n.role.value,
+                "depends_on": sorted(n.depends_on),
+                "mandatory": n.mandatory,
+                "node_version": n.node_version,
+            }
+            for n in graph.nodes
+        ]
+    )
+
+
+def _record_from_dict(data: dict[str, Any]) -> NodeRecord:
+    required = ("run_id", "node_id", "role", "node_version", "target_commit", "scope_id")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise CheckpointError(
+            "checkpoint node record missing: " + ", ".join(missing)
+        )
+    try:
+        record = NodeRecord(
+            run_id=str(data["run_id"]),
+            node_id=str(data["node_id"]),
+            role=NodeRole(str(data["role"])),
+            node_version=str(data["node_version"]),
+            target_commit=str(data["target_commit"]),
+            scope_id=str(data["scope_id"]),
+        )
+        for name in (
+            "parent_node_ids",
+            "input_evidence_ids",
+            "output_evidence_ids",
+            "context_source_ids",
+        ):
+            value = data.get(name, [])
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise CheckpointError(f"checkpoint node record {name} must be a string array")
+            setattr(record, name, list(value))
+        for name in (
+            "input_digest",
+            "output_digest",
+            "started_at",
+            "finished_at",
+            "model",
+            "provider",
+            "error",
+            "blocker",
+            "context_digest",
+        ):
+            value = data.get(name)
+            setattr(record, name, value if value is None or isinstance(value, str) else str(value))
+        record.duration_seconds = (
+            None if data.get("duration_seconds") is None else float(data["duration_seconds"])
+        )
+        record.input_tokens = (
+            None if data.get("input_tokens") is None else int(data["input_tokens"])
+        )
+        record.output_tokens = (
+            None if data.get("output_tokens") is None else int(data["output_tokens"])
+        )
+        record.cost_usd = None if data.get("cost_usd") is None else float(data["cost_usd"])
+        record.retry_count = int(data.get("retry_count", 0))
+        record.context_approx_tokens = (
+            None
+            if data.get("context_approx_tokens") is None
+            else int(data["context_approx_tokens"])
+        )
+        record.status = NodeStatus(str(data.get("status", NodeStatus.PENDING.value)))
+        return record
+    except (TypeError, ValueError) as exc:
+        if isinstance(exc, CheckpointError):
+            raise
+        raise CheckpointError(f"checkpoint node record is invalid: {exc}") from exc
 
 
 class Runner:
@@ -168,40 +277,118 @@ class Runner:
         world: dict[str, Any],
         *,
         run_id: str | None = None,
+        checkpoint_path: str | Path | None = None,
+        resume_from: str | Path | None = None,
     ) -> RunResult:
-        run_id = run_id or new_run_id()
+        """Execute or resume a graph from the last sealed node boundary.
+
+        A resumed run keeps the original run id and completed node records, but
+        uses this Runner's executor for work that had not completed. This allows
+        an operator to change provider after an interruption without silently
+        re-running or rewriting already-recorded evidence.
+        """
+
+        graph_digest = _graph_digest(graph)
+        world_digest = digest(world)
+        checkpoint_target = Path(checkpoint_path) if checkpoint_path is not None else None
+
         # Keep caller-owned context immutable while allowing evidence produced by
         # one node to become input to a downstream node in the same run.
         run_world = dict(world)
         if "node_records" not in run_world:
             run_world["_sechelix_manage_node_records"] = True
-        builder = self._context_builder_factory(run_world)
-        result = RunResult(
-            run_id=run_id,
-            target_commit=self.target_commit,
-            scope_id=self.scope_id,
-            graph_digest=digest(
-                [
-                    {
-                        "node_id": n.node_id,
-                        "role": n.role.value,
-                        "depends_on": sorted(n.depends_on),
-                        "mandatory": n.mandatory,
-                        "node_version": n.node_version,
-                    }
-                    for n in graph.nodes
-                ]
-            ),
-            executor_name=getattr(self.executor, "name", type(self.executor).__name__),
-            started_at=_now(),
-        )
-        result._mandatory = {n.node_id: n.mandatory for n in graph.nodes}
 
         satisfied: set[str] = set()
         done: set[str] = set()
 
+        if resume_from is not None:
+            checkpoint = load_checkpoint(resume_from)
+            if checkpoint.target_commit != self.target_commit:
+                raise CheckpointError("checkpoint target commit does not match resumed run")
+            if checkpoint.scope_id != self.scope_id:
+                raise CheckpointError("checkpoint scope does not match resumed run")
+            if checkpoint.graph_digest != graph_digest:
+                raise CheckpointError("checkpoint graph does not match resumed run")
+            if checkpoint.world_digest != world_digest:
+                raise CheckpointError("checkpoint input world changed since interruption")
+            if run_id is not None and run_id != checkpoint.run_id:
+                raise CheckpointError("requested run_id does not match checkpoint run_id")
+            run_id = checkpoint.run_id
+            self.budget.restore(checkpoint.budget)
+            result = RunResult(
+                run_id=run_id,
+                target_commit=self.target_commit,
+                scope_id=self.scope_id,
+                graph_digest=graph_digest,
+                executor_name=getattr(self.executor, "name", type(self.executor).__name__),
+                started_at=checkpoint.started_at,
+                records={
+                    node_id: _record_from_dict(record)
+                    for node_id, record in checkpoint.records.items()
+                },
+                outputs={
+                    node_id: dict(output)
+                    for node_id, output in checkpoint.outputs.items()
+                },
+                routing=[
+                    RoutingDecision.from_dict(item) for item in checkpoint.routing
+                ],
+                context_views={
+                    node_id: dict(view)
+                    for node_id, view in checkpoint.context_views.items()
+                },
+            )
+            completed = set(checkpoint.completed_node_ids)
+            graph_ids = set(graph.topological_order())
+            if not completed <= graph_ids:
+                raise CheckpointError(
+                    "checkpoint contains nodes that are absent from resumed graph"
+                )
+            for node_id in graph.topological_order():
+                if node_id not in completed:
+                    continue
+                record = result.records[node_id]
+                node = graph[node_id]
+                if (
+                    record.run_id != run_id
+                    or record.node_id != node_id
+                    or record.role is not node.role
+                    or record.node_version != node.node_version
+                    or record.target_commit != self.target_commit
+                    or record.scope_id != self.scope_id
+                ):
+                    raise CheckpointError(
+                        f"checkpoint record identity drift for node {node_id}"
+                    )
+                done.add(node_id)
+                if record.satisfied:
+                    satisfied.add(node_id)
+                    self._promote_output(
+                        run_world,
+                        node,
+                        result.outputs.get(node_id, {}),
+                        result,
+                    )
+            if checkpoint_target is None:
+                checkpoint_target = Path(resume_from)
+        else:
+            run_id = run_id or new_run_id()
+            result = RunResult(
+                run_id=run_id,
+                target_commit=self.target_commit,
+                scope_id=self.scope_id,
+                graph_digest=graph_digest,
+                executor_name=getattr(self.executor, "name", type(self.executor).__name__),
+                started_at=_now(),
+            )
+
+        result._mandatory = {n.node_id: n.mandatory for n in graph.nodes}
+        builder = self._context_builder_factory(run_world)
+
         for node_id in graph.topological_order():
             node = graph[node_id]
+            if node_id in done:
+                continue
 
             # A dependency that never delivered blocks this node. Recorded, not
             # skipped: the question this node exists to answer is still open.
@@ -216,6 +403,39 @@ class Runner:
                     RoutingDecision(node_id, node.role.value, False,
                                     f"blocked by {', '.join(unmet)}")
                 )
+                self._write_checkpoint(checkpoint_target, result, world_digest, done)
+                continue
+
+            # Applicability: the independent verifier exists to re-derive
+            # candidate findings. With no candidates in the world there is
+            # nothing to verify, so the lane is inapplicable (SKIPPED) -- a real
+            # answer that keeps an otherwise-clean run from failing -- rather
+            # than under-informed (BLOCKED). This reaches here only after the
+            # verifier's dependencies are satisfied, so the candidate set is
+            # final; and it cannot let a finding escape verification, because
+            # there are no candidates. A failed/blocked upstream lane is handled
+            # by the dependency check above and never reaches this branch.
+            if (
+                node.role is NodeRole.INDEPENDENT_VERIFIER
+                and not _world_has_candidates(run_world)
+            ):
+                self._record_skipped(
+                    result, node_id, node.role, node.node_version,
+                    "no candidate findings to verify",
+                )
+                satisfied.add(node_id)
+                done.add(node_id)
+                if run_world.get("_sechelix_manage_node_records") is True:
+                    run_world["node_records"] = [
+                        record.to_dict()
+                        for _n, record in sorted(result.records.items())
+                    ]
+                result.routing.append(
+                    RoutingDecision(
+                        node_id, node.role.value, False, "no candidates to verify"
+                    )
+                )
+                self._write_checkpoint(checkpoint_target, result, world_digest, done)
                 continue
 
             view = builder.build(node_id, node.role)
@@ -233,6 +453,7 @@ class Runner:
                 result.routing.append(
                     RoutingDecision(node_id, node.role.value, False, "incomplete context")
                 )
+                self._write_checkpoint(checkpoint_target, result, world_digest, done)
                 continue
 
             result.context_views[node_id] = view.to_dict()
@@ -248,6 +469,7 @@ class Runner:
                 result.routing.append(
                     RoutingDecision(node_id, node.role.value, False, "budget: max_nodes")
                 )
+                self._write_checkpoint(checkpoint_target, result, world_digest, done)
                 continue
 
             reserved_cost = 0.0
@@ -264,6 +486,7 @@ class Runner:
                         RoutingDecision(node_id, node.role.value, False,
                                         "budget: max_cost_usd")
                     )
+                    self._write_checkpoint(checkpoint_target, result, world_digest, done)
                     continue
 
             record = self._execute(result, node_id, node, view, reserved_cost)
@@ -279,10 +502,58 @@ class Runner:
             result.routing.append(
                 RoutingDecision(node_id, node.role.value, True, node.reason or "applicable")
             )
+            self._write_checkpoint(checkpoint_target, result, world_digest, done)
 
         result.finished_at = _now()
         result.budget_snapshot = self.budget.snapshot()
+        # Surface the run's canonical, already-promoted findings on the result
+        # so a persisted run.json carries them without a reader having to walk
+        # per-node outputs. These are the exact finding-v1 records the verifier
+        # promoted into the world; nothing here promotes or invents anything.
+        findings = run_world.get("verified_findings")
+        if isinstance(findings, list):
+            result.verified_findings = [dict(item) for item in findings if isinstance(item, dict)]
         return result
+
+    def _write_checkpoint(
+        self,
+        path: Path | None,
+        result: RunResult,
+        world_digest: str,
+        done: set[str],
+    ) -> None:
+        if path is None:
+            return
+        result.budget_snapshot = self.budget.snapshot()
+        checkpoint = RunnerCheckpoint(
+            run_id=result.run_id,
+            target_commit=result.target_commit,
+            scope_id=result.scope_id,
+            graph_digest=result.graph_digest,
+            world_digest=world_digest,
+            started_at=result.started_at,
+            completed_node_ids=tuple(
+                node_id for node_id in result.records if node_id in done
+            ),
+            records={
+                node_id: result.records[node_id].to_dict()
+                for node_id in result.records
+                if node_id in done
+            },
+            outputs={
+                node_id: dict(result.outputs.get(node_id, {}))
+                for node_id in result.records
+                if node_id in done
+            },
+            routing=tuple(item.to_dict() for item in result.routing),
+            context_views={
+                node_id: dict(view)
+                for node_id, view in result.context_views.items()
+                if node_id in done
+            },
+            budget=result.budget_snapshot,
+        )
+        write_checkpoint(path, checkpoint)
 
     # -- internals -----------------------------------------------------------
 
@@ -348,10 +619,60 @@ class Runner:
             )
             world["evidence"] = evidence_items
 
-        if node.role is NodeRole.INDEPENDENT_VERIFIER and isinstance(candidates, list):
-            # Keep this distinct from formal report-v1 findings. A verifier
-            # candidate is not automatically a VERIFIED finding.
-            world["verified_candidates"] = list(candidates)
+        if node.role is NodeRole.INDEPENDENT_VERIFIER:
+            assessments = output.get("assessments") if isinstance(output, dict) else None
+            if isinstance(assessments, list):
+                # A verifier classification remains distinct from a finding. A
+                # full-workflow executor may additionally attach canonical,
+                # contract-validated finding-v1 records after explicit
+                # operator-authored promotion inputs have been satisfied.
+                world["verifier_assessments"] = [
+                    dict(item) for item in assessments if isinstance(item, dict)
+                ]
+            elif isinstance(candidates, list):
+                # Backward-compatible visibility for old replay recordings. These
+                # are deliberately not promoted to findings.
+                world["verified_candidates"] = list(candidates)
+
+            verified_findings = (
+                output.get("verified_findings") if isinstance(output, dict) else None
+            )
+            if isinstance(verified_findings, list):
+                canonical = [
+                    dict(item) for item in verified_findings if isinstance(item, dict)
+                ]
+                world["verified_findings"] = canonical
+                world["findings"] = canonical
+
+        if node.role is NodeRole.REMEDIATOR:
+            patches = output.get("patches") if isinstance(output, dict) else None
+            remediation_results = (
+                output.get("remediation_results") if isinstance(output, dict) else None
+            )
+            if isinstance(patches, list):
+                world["patches"] = [
+                    dict(item) for item in patches if isinstance(item, dict)
+                ]
+            if isinstance(remediation_results, list):
+                world["remediation_results"] = [
+                    dict(item) for item in remediation_results if isinstance(item, dict)
+                ]
+
+        if node.role is NodeRole.PATCH_VERIFIER:
+            patch_verification = (
+                output.get("patch_verification") if isinstance(output, dict) else None
+            )
+            if isinstance(patch_verification, dict):
+                world["patch_verification"] = dict(patch_verification)
+            final_remediation_results = (
+                output.get("remediation_results") if isinstance(output, dict) else None
+            )
+            if isinstance(final_remediation_results, list):
+                world["remediation_results"] = [
+                    dict(item)
+                    for item in final_remediation_results
+                    if isinstance(item, dict)
+                ]
 
         if world.get("_sechelix_manage_node_records") is True:
             world["node_records"] = [
@@ -409,6 +730,25 @@ class Runner:
         result.records[node_id] = record
         result.outputs[node_id] = outcome.output
         return record
+
+    def _record_skipped(
+        self, result, node_id, role: NodeRole, node_version: str, reason: str,
+    ) -> None:
+        now = _now()
+        record = NodeRecord(
+            run_id=result.run_id,
+            node_id=node_id,
+            role=role,
+            node_version=node_version,
+            target_commit=self.target_commit,
+            scope_id=self.scope_id,
+            status=NodeStatus.SKIPPED,
+            blocker=reason,
+            started_at=now,
+            finished_at=now,
+            duration_seconds=0.0,
+        )
+        result.records[node_id] = record
 
     def _record_blocked(
         self, result, node_id, role: NodeRole, node_version: str, blocker: str, *,

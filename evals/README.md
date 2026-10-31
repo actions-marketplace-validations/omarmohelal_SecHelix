@@ -32,9 +32,57 @@ blind spot and keep the literal string, recorded in `results/not-measured.json`.
    ```
 
 The runner reports precision, recall, verified precision, false-positive rate,
-duplicate-root-cause rate, time, token cost, model/provider identity, and
-scanner contribution when supplied. Missing operational measurements remain
+duplicate-root-cause rate, time, token cost, model/provider identity, and raw
+scanner-source mention counts when supplied. Those mention counts are **not** a
+measurement of scanner contribution. Missing operational measurements remain
 `NOT_MEASURED`; they are never converted to zero.
+
+## Controlled scanner contribution ablation
+
+`scanner_ablation.py` measures the delta of a declared scanner bundle only when
+control and treatment runs use the same blind cases, model, provider, host,
+execution mode, prompt reference, fixture-suite version and case digest. The
+control arm must declare scanners disabled; the treatment arm declares the
+scanner source(s) enabled.
+
+```bash
+python evals/scanner_ablation.py \\
+  --control work/scanner-control.json \\
+  --treatment work/scanner-treatment.json \\
+  --output work/scanner-ablation.json
+```
+
+Both packets must share an `ablation_run_id` and include `scanner_ablation`
+metadata. The output reports deltas for precision, detection recall, verified
+precision, false-positive rate, false-positive rejection, and operational
+cost/time/token fields when both arms measured them. It also reports aggregate
+counts of detections gained/lost and clean false positives removed/introduced.
+
+If multiple scanners are enabled together, the result is explicitly
+**bundle-level only**. SecHelix does not assign causal credit to an individual
+tool unless that tool is isolated in its own treatment arm. This paired label
+ablation is also not a full-workflow Arena score and does not establish
+production effectiveness.
+
+## Isolated scanner matrix
+
+`scanner_ablation_matrix.py` composes several single-scanner treatment arms
+against one scanner-disabled control. Every treatment must enable exactly one
+unique scanner and must satisfy the same matched-condition checks as the paired
+ablation. This produces one attributable row per isolated scanner without
+pretending a multi-tool bundle identifies which tool caused a change.
+
+```bash
+python evals/scanner_ablation_matrix.py \\
+  --control work/scanner-control.json \\
+  --treatment work/semgrep.json \\
+  --treatment work/session-token-trust.json \\
+  --output work/scanner-matrix.json
+```
+
+Operational delta totals remain `NOT_MEASURED` unless every treatment measured
+the corresponding time/token/cost field. Aggregate changed-case counts sum
+separate counterfactual arms and are not unique findings or a production score.
 
 ## Full-workflow Arena
 
@@ -55,3 +103,170 @@ See [`arena/README.md`](arena/README.md) and start from
 
 Fixtures are synthetic source fragments for static reasoning. Do not deploy
 them, attach live credentials, or point them at external targets.
+
+## Fixture realism tiers
+
+`fixture_tiers.py` validates a conservative registry of benchmark realism in
+`fixture-tiers.json`. The tiers are intentionally about fixture depth, not
+security effectiveness:
+
+- `STATIC_PAIR`: source-only vulnerable/clean siblings;
+- `LOCAL_PRIMITIVE`: deterministic bounded loopback proof execution;
+- `REAL_BROWSER_INTEGRATION`: actual browser-engine integration against
+  literal-loopback fixtures;
+- `STATEFUL_APPLICATION`: a durable multi-step LOCAL application with at least
+  two authenticated personas and deterministic reset;
+- `COMPOSITE_APPLICATION`: the stateful tier plus multiple services and an
+  asynchronous boundary.
+
+Higher-tier claims fail closed when required properties are absent. Entries
+marked `PLANNED` remain planned and cannot be presented as measured. Even a measured
+composite LOCAL fixture does not establish production effectiveness and does not
+replace the uncontaminated independent full-workflow Arena protocol.
+
+Validate the registry with:
+
+```bash
+python evals/fixture_tiers.py
+```
+
+### Stateful application fixture
+
+The first `STATEFUL_APPLICATION` fixture is now executable through
+`production_like_fixture.py`. It is a literal-loopback HTTP application with
+SQLite durable state, three distinct fixture personas (customer, reviewer and
+finance), a request → approve → settle refund workflow, role/prerequisite
+enforcement and deterministic reset.
+
+```bash
+python evals/production_like_fixture.py \
+  --output work/stateful-fixture.json
+```
+
+The emitted `MEASURED` status applies only to the fixture self-test contract.
+The artifact explicitly keeps `production_effectiveness_established=false`
+and `arena_full_workflow_measured=false`. It is therefore evidence that the
+fixture behaves deterministically, not a SecHelix accuracy or production claim.
+
+### Composite application fixture
+
+`composite_application_fixture.py` extends the controlled LOCAL topology to two
+independent loopback services. The workflow service owns refund request/approval
+and writes a durable outbox event; a separate ledger-worker service consumes that
+event and applies the financial effect exactly once.
+
+```bash
+python evals/composite_application_fixture.py \
+  --output work/composite-fixture.json
+```
+
+The shared SQLite store gives the fixture durable workflow, outbox and ledger
+state plus a deterministic reset. The outbox is an explicit asynchronous
+boundary, and the self-test checks that no ledger effect exists before
+consumption, exactly one effect exists after consumption, and replay does not
+duplicate it. This remains a controlled fixture-contract measurement, not an
+Arena or production-effectiveness result.
+
+
+## Dynamic proof primitive benchmark
+
+`dynamic_proof_benchmark.py` executes paired vulnerable/clean LOCAL fixtures for
+SecHelix's deterministic proof primitives. It now covers every bounded `ProofClass` currently implemented by the LOCAL
+proof executor, with one vulnerable and one clean sibling per class. Coverage
+includes authorization/IDOR, race/idempotency, webhook signature/replay, XSS,
+SSRF callback, path traversal, CSRF, CORS policy, a tiny declared rate-limit
+invariant, one exact known-default credential attempt, session revocation, state
+transition, payment invariants, workflow sequencing, cross-entity money flow,
+and settlement/refund sequencing. The CORS pair uses read-only requests, the
+rate-limit pair sends only one request above a predeclared allowance (at most
+six total), and the known-default pair performs exactly one fixture login
+attempt; none of these are load, guessing, or credential-stuffing benchmarks.
+
+Run it with:
+
+```bash
+python evals/dynamic_proof_benchmark.py --sechelix-commit <commit> --output work/dynamic-proof-result.json
+```
+
+The artifact records per-case proof class, expected/observed behavior, request
+count and elapsed time, plus aggregate case accuracy, vulnerable-behavior
+recall, clean-behavior rejection rate, inconclusive rate, and explicit proof
+class coverage. CI requires the missing-proof-class list to stay empty.
+
+This is deliberately **not** a full SecHelix benchmark. It does not exercise
+candidate discovery, model reasoning, independent verification, remediation,
+regression generation, or release-gate decisions. Those remain governed by the
+full-workflow Arena protocol and must not inherit scores from this primitive
+benchmark.
+
+
+## Real-browser XSS integration benchmark
+
+`real_browser_xss_benchmark.py` is a separate optional integration benchmark
+for the bounded XSS proof. Unlike the deterministic primitive benchmark, it uses
+SecHelix's actual `SafeAuthorizedBrowser` / Playwright Chromium backend by
+default against a literal-loopback vulnerable/clean fixture pair.
+
+Run it with:
+
+```bash
+python evals/real_browser_xss_benchmark.py \
+  --sechelix-commit <commit> \
+  --output work/real-browser-xss.json
+```
+
+If Playwright or Chromium is unavailable, the artifact reports
+`BLOCKED_BY_ENVIRONMENT`; it does not convert missing browser infrastructure
+into a clean result or a benchmark failure. When the browser is available, both
+the executing vulnerable fixture and inert-text clean fixture must classify
+correctly for the integration result to be `MEASURED`.
+
+This result kind is `REAL_BROWSER_XSS_INTEGRATION_BENCHMARK`. It measures a
+browser-engine integration slice only and must not be presented as full
+SecHelix workflow precision/recall, verifier accuracy, remediation quality or
+release-gate accuracy.
+
+
+## Real-browser session integration benchmark
+
+`real_browser_session_benchmark.py` measures the optional Playwright-backed
+imported-session path using two isolated browser contexts against a
+literal-loopback protected fixture. One context receives a valid ephemeral
+fixture session and must observe the operator-defined protected selector; a
+separate context receives an invalid session and must not.
+
+```bash
+python evals/real_browser_session_benchmark.py \
+  --sechelix-commit <commit> \
+  --output work/real-browser-session.json
+```
+
+Session cookie values are execution-only inputs and never enter the result. The benchmark now also reuses one browser context across a deterministic LOCAL server-side revocation event for paired stale-authority versus immediate-revocation fixtures
+artifact. Missing Playwright/Chromium reports `BLOCKED_BY_ENVIRONMENT` rather
+than a clean result.
+
+This is an integration measurement for browser context isolation and session
+verification. It is separate from the session-revocation proof and is not a
+full SecHelix workflow score.
+
+
+## Repeated isolated scanner trials
+
+`scanner_ablation_trials.py` aggregates two or more isolated scanner matrices
+from separate matched runs. Each matrix may have a different
+`ablation_run_id`, but model, provider, host, execution mode, prompt reference,
+blind case digest, fixture-suite version, and isolated scanner set must match
+exactly.
+
+```bash
+python evals/scanner_ablation_trials.py \
+  --matrix work/scanner-matrix-run-1.json \
+  --matrix work/scanner-matrix-run-2.json \
+  --matrix work/scanner-matrix-run-3.json \
+  --output work/scanner-trials.json
+```
+
+The result reports mean/min/max deltas per isolated scanner and aggregate/mean
+changed-case counts across trials. Missing time/token/cost telemetry remains
+`NOT_MEASURED`; it is never treated as zero. The helper does not calculate
+statistical significance or generalize the authored fixture suite to production.

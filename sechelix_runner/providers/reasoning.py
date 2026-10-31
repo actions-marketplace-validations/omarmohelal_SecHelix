@@ -19,15 +19,19 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..digests import digest
 from ..executor import NodeOutcome
 from ..graph import GraphNode
 from ..roles import NodeRole, NodeStatus
 from .base import (
     NODE_OUTPUT_SCHEMA,
+    VERIFIER_CLASSIFICATIONS,
+    VERIFIER_OUTPUT_SCHEMA,
     ProviderError,
     ProviderExecutor,
     extract_json,
     validate_node_output,
+    validate_verifier_output,
 )
 
 #: Fields a verifier must never receive from the hunter that raised a candidate.
@@ -54,11 +58,116 @@ def verifier_view(candidate: dict[str, Any]) -> dict[str, Any]:
     Keeps the claim and where to look. Removes anything stating how convinced
     somebody already was.
     """
-    return {
+    stripped = {
         key: value
         for key, value in candidate.items()
         if key.lower() not in FORBIDDEN_VERIFIER_FIELDS
+        and key != "candidate_ref"
     }
+    # Bind the verifier response to the exact neutralized candidate it received.
+    # The reference carries no verdict and cannot promote a finding by itself.
+    return {"candidate_ref": digest(stripped), **stripped}
+
+
+def _evidence_ids(value: Any) -> set[str]:
+    """Collect stable evidence identifiers already present in a least-context view."""
+
+    found: set[str] = set()
+    if isinstance(value, dict):
+        evidence_id = value.get("evidence_id")
+        if isinstance(evidence_id, str) and evidence_id.strip():
+            found.add(evidence_id)
+        evidence_ids = value.get("evidence_ids")
+        if isinstance(evidence_ids, list):
+            found.update(
+                item for item in evidence_ids
+                if isinstance(item, str) and item.strip()
+            )
+        for nested in value.values():
+            found.update(_evidence_ids(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            found.update(_evidence_ids(nested))
+    return found
+
+
+def _validate_verifier_binding(
+    payload: dict[str, Any],
+    view: dict[str, Any],
+) -> list[str]:
+    """Require one assessment for every exact neutralized input candidate."""
+
+    raw_candidates = view.get("candidates") or []
+    expected_rows = {
+        neutral["candidate_ref"]: neutral
+        for candidate in raw_candidates
+        if isinstance(candidate, dict)
+        for neutral in (verifier_view(candidate),)
+    }
+    assessments = payload.get("assessments")
+    if not isinstance(assessments, list):
+        return []
+    actual = [
+        row.get("candidate_ref")
+        for row in assessments
+        if isinstance(row, dict) and isinstance(row.get("candidate_ref"), str)
+    ]
+    problems: list[str] = []
+    expected = sorted(expected_rows)
+    if sorted(actual) != expected:
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        problems.append(
+            "verifier assessments must cover the exact supplied candidate_ref set; "
+            f"missing={missing}, extra={extra}, expected_count={len(expected)}, "
+            f"actual_count={len(actual)}"
+        )
+
+    available_evidence_ids = _evidence_ids(
+        {key: value for key, value in view.items() if key != "candidates"}
+    )
+    for row in assessments:
+        if not isinstance(row, dict):
+            continue
+        candidate_ref = row.get("candidate_ref")
+        neutral = expected_rows.get(candidate_ref)
+        if neutral is None:
+            continue
+        for field in ("claim", "location"):
+            supplied = neutral.get(field)
+            returned = row.get(field)
+            # The verifier must echo the identifying fields, not reword them:
+            # binding a verdict to one candidate_ref while describing a different
+            # claim is exactly the bait-and-switch this guard exists to stop.
+            # Incidental surrounding whitespace (a trailing newline on an
+            # otherwise faithful copy) is not a rewrite, so it does not fail the
+            # node; any substantive difference still does.
+            same = (
+                returned.strip() == supplied.strip()
+                if isinstance(returned, str) and isinstance(supplied, str)
+                else returned == supplied
+            )
+            if not same:
+                problems.append(
+                    f"assessment {candidate_ref} changed the supplied {field}"
+                )
+        if "hypothesis_ids" in row and row.get("hypothesis_ids") != neutral.get(
+            "hypothesis_ids", []
+        ):
+            problems.append(
+                f"assessment {candidate_ref} changed the supplied hypothesis_ids"
+            )
+        cited_evidence = {
+            item for item in row.get("evidence_ids", [])
+            if isinstance(item, str)
+        }
+        unknown_evidence = sorted(cited_evidence - available_evidence_ids)
+        if unknown_evidence:
+            problems.append(
+                f"assessment {candidate_ref} cites evidence not present in its "
+                f"least-context view: {unknown_evidence}"
+            )
+    return problems
 
 
 _ROLE_TASK: dict[NodeRole, str] = {
@@ -119,14 +228,30 @@ You are an INDEPENDENT VERIFIER. You have deliberately not been told how
 confident anyone was, what severity anyone assigned, or what any other verifier
 concluded. Do not ask for it and do not assume it.
 
-For each claim: reconstruct it from the evidence and actively try to refute it.
-Return a candidate ONLY for claims you could NOT refute, with "why" stating what
-the evidence establishes. Refuting a claim is a success, not a failure.
+Assess EVERY supplied candidate exactly once. Three fields identify the candidate
+and MUST be copied back verbatim -- character for character, exactly as supplied.
+Do not reword, summarise, translate, shorten, or reformat any of them:
+  - candidate_ref : the sha256:... identifier that binds your assessment
+  - claim         : copy the supplied claim text unchanged
+  - location      : copy the supplied location unchanged
+Your independent analysis goes ONLY in the fields you author: classification,
+why, refutation_attempt, and evidence_ids. Re-derive from the supplied evidence
+whether the claim holds and actively try to refute it -- but report the claim you
+assessed in its original words, not your own paraphrase.
+classification must be one of: VERIFIED, LIKELY_BUT_UNPROVEN, FALSE_POSITIVE,
+DUPLICATE_ROOT_CAUSE, BLOCKED_BY_ENVIRONMENT. VERIFIED requires at least one
+stable evidence_id already present in the Evidence block; never invent an
+evidence reference. VERIFIED means only that this independent verification pass
+could not refute the claim and established the stated basis. It does NOT assign
+severity, create a canonical finding, or make a release decision.
+Refuting a claim is a success, not a failure.
 
 Return ONLY a JSON object of this shape, with no prose around it:
-{"candidates": [{"claim": "...", "location": "...", "why": "...",
-                 "attacker_control": "...", "hypothesis_ids": []}],
- "examined": ["..."], "notes": "refuted: ..."}
+{"assessments": [{"candidate_ref": "sha256:...", "classification": "VERIFIED",
+                  "claim": "...", "location": "...", "why": "...",
+                  "refutation_attempt": "...", "evidence_ids": ["EV-..."],
+                  "hypothesis_ids": []}],
+ "examined": ["..."], "notes": "..."}
 """.strip()
 
 
@@ -139,10 +264,44 @@ def build_prompt(node: GraphNode, view: dict[str, Any], *, max_chars: int = 2400
         else _SHARED_RULES
     )
 
+    if node.role is not NodeRole.INDEPENDENT_VERIFIER:
+        launch_checks = view.get("launch_checks")
+        if isinstance(launch_checks, list) and launch_checks:
+            launch_ids = [
+                str(item.get("id"))
+                for item in launch_checks
+                if isinstance(item, dict) and item.get("id")
+            ]
+            task += (
+                " Evaluate every assigned launch check explicitly: "
+                + ", ".join(launch_ids)
+                + "."
+            )
+            rules += (
+                "\nLaunch-profile rules:\n"
+                "- Put every assigned LAUNCH-XX id in examined exactly once, even "
+                "when no candidate is supportable.\n"
+                "- Any candidate raised for a launch check must include that exact "
+                "LAUNCH-XX id in hypothesis_ids.\n"
+                "- An examined check with no candidate is not PASS; it only means "
+                "this node produced no supportable candidate from its supplied evidence."
+            )
+
     payload = dict(view)
     if node.role is NodeRole.INDEPENDENT_VERIFIER:
         candidates = payload.get("candidates") or []
-        payload["candidates"] = [verifier_view(c) for c in candidates if isinstance(c, dict)]
+        unique_candidates: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            neutral = verifier_view(candidate)
+            candidate_ref = neutral["candidate_ref"]
+            if candidate_ref in seen_refs:
+                continue
+            seen_refs.add(candidate_ref)
+            unique_candidates.append(neutral)
+        payload["candidates"] = unique_candidates
 
     body = json.dumps(payload, indent=2, sort_keys=True, default=str)
     if len(body) > max_chars:
@@ -186,8 +345,34 @@ class ReasoningExecutor:
         prompt = build_prompt(node, view)
         self.prompts.append((node.node_id, prompt))
 
+        # Tell a structured-output-capable provider exactly which schema this node
+        # must return. A provider that cannot constrain output ignores it; the
+        # downstream validator below still runs either way, so this never relaxes
+        # the fail-closed check -- it only makes a conforming response more likely.
+        response_schema = (
+            VERIFIER_OUTPUT_SCHEMA
+            if node.role is NodeRole.INDEPENDENT_VERIFIER
+            else NODE_OUTPUT_SCHEMA
+        )
+
         try:
-            result = self.provider.invoke(prompt, timeout=self.timeout)
+            # Role-aware providers (Nexus) pick a model/persona from node.role;
+            # structured-output providers (OpenRouter, wasm) constrain the output
+            # to response_schema. These are independent capabilities, so thread
+            # the schema through both paths -- a provider that cannot honor it
+            # ignores it, and the fail-closed validator below runs regardless.
+            role_invoke = getattr(self.provider, "invoke_for_role", None)
+            if callable(role_invoke):
+                result = role_invoke(
+                    node.role,
+                    prompt,
+                    timeout=self.timeout,
+                    response_schema=response_schema,
+                )
+            else:
+                result = self.provider.invoke(
+                    prompt, timeout=self.timeout, response_schema=response_schema
+                )
         except ProviderError as exc:
             return NodeOutcome(status=NodeStatus.FAILED, error=str(exc))
 
@@ -204,7 +389,13 @@ class ReasoningExecutor:
                 cost_usd=result.cost_usd,
             )
 
-        problems = validate_node_output(payload)
+        problems = (
+            validate_verifier_output(payload)
+            if node.role is NodeRole.INDEPENDENT_VERIFIER
+            else validate_node_output(payload)
+        )
+        if not problems and node.role is NodeRole.INDEPENDENT_VERIFIER:
+            problems.extend(_validate_verifier_binding(payload, view))
         if problems:
             # Fail closed. A partially-understood response must never become a
             # candidate: the schema exists precisely so this is detectable.
@@ -232,7 +423,10 @@ class ReasoningExecutor:
 __all__ = [
     "FORBIDDEN_VERIFIER_FIELDS",
     "NODE_OUTPUT_SCHEMA",
+    "VERIFIER_CLASSIFICATIONS",
+    "VERIFIER_OUTPUT_SCHEMA",
     "ReasoningExecutor",
     "build_prompt",
+    "validate_verifier_output",
     "verifier_view",
 ]

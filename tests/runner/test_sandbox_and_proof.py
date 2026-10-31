@@ -146,6 +146,14 @@ class ProofPlanTests(unittest.TestCase):
         "local_browser_runtime",
         "local_callback_listener",
         "fixture_filesystem",
+        "fixture_authenticated_session",
+        "fixture_session_revocation",
+        "fixture_state_readback",
+        "fixture_financial_readback",
+        "fixture_reset",
+        "fixture_cors_probe",
+        "fixture_rate_limit_probe",
+        "fixture_default_credential_test",
     }
 
     def test_every_class_produces_a_complete_plan(self) -> None:

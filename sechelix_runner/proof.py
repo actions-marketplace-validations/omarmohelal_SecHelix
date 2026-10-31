@@ -33,6 +33,16 @@ class ProofClass(str, Enum):
     XSS_EXECUTION = "XSS_EXECUTION"
     SSRF_CALLBACK = "SSRF_CALLBACK"
     PATH_TRAVERSAL = "PATH_TRAVERSAL"
+    CSRF_REQUEST = "CSRF_REQUEST"
+    CORS_POLICY = "CORS_POLICY"
+    RATE_LIMIT_INVARIANT = "RATE_LIMIT_INVARIANT"
+    KNOWN_DEFAULT_CREDENTIAL = "KNOWN_DEFAULT_CREDENTIAL"
+    SESSION_REVOCATION = "SESSION_REVOCATION"
+    STATE_TRANSITION = "STATE_TRANSITION"
+    PAYMENT_INVARIANT = "PAYMENT_INVARIANT"
+    WORKFLOW_SEQUENCE = "WORKFLOW_SEQUENCE"
+    MONEY_FLOW_INVARIANT = "MONEY_FLOW_INVARIANT"
+    SETTLEMENT_REFUND_SEQUENCE = "SETTLEMENT_REFUND_SEQUENCE"
 
 
 class PlanState(str, Enum):
@@ -242,6 +252,249 @@ def _ssrf(finding_id: str) -> ProofPlan:
     )
 
 
+
+def _csrf(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.CSRF_REQUEST,
+        finding_id,
+        preconditions=[
+            "the fixture endpoint performs one harmless state-changing action",
+            "an authenticated fixture session is available",
+            "the endpoint is browser-reachable and cookies would normally accompany the request",
+        ],
+        required_authority=["fixture_authenticated_session", "fixture_write_access"],
+        actions=[
+            "send the harmless action with the expected same-origin Origin header as a control",
+            "send the same harmless action with the same authenticated session but a fixed foreign Origin",
+            "compare whether the foreign-origin request is rejected before the action is applied",
+        ],
+        expected_secure_behavior=(
+            "the same-origin control succeeds and the foreign-origin authenticated request is denied"
+        ),
+        expected_vulnerable_behavior=(
+            "the foreign-origin authenticated request is accepted like the same-origin control"
+        ),
+    )
+
+
+def _cors_policy(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.CORS_POLICY,
+        finding_id,
+        preconditions=[
+            "the local fixture declares one approved cross-origin caller and one fixed foreign origin",
+            "the tested endpoint is a harmless read whose response represents the intended CORS policy",
+        ],
+        required_authority=["fixture_cors_probe"],
+        actions=[
+            "send one read with the declared approved Origin header and record only CORS response headers",
+            "send the same read with a fixed foreign Origin header",
+            "compare Access-Control-Allow-Origin and credential semantics against the declared policy",
+        ],
+        expected_secure_behavior=(
+            "the approved origin receives the declared CORS grant and the foreign origin cannot obtain a browser-readable grant"
+        ),
+        expected_vulnerable_behavior=(
+            "the foreign origin receives an Access-Control-Allow-Origin grant that would make the response browser-readable under the declared credential mode"
+        ),
+    )
+
+
+def _rate_limit(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.RATE_LIMIT_INVARIANT,
+        finding_id,
+        preconditions=[
+            "the local fixture declares the exact small request allowance being verified",
+            "the endpoint can be exercised with at most six harmless requests without resource exhaustion",
+        ],
+        required_authority=["fixture_rate_limit_probe"],
+        actions=[
+            "send exactly the declared number of allowed harmless requests as the control",
+            "send one additional request",
+            "record whether that one additional request is rate-limited",
+        ],
+        expected_secure_behavior=(
+            "the declared allowed requests succeed and the single excess request is rejected by the rate-limit boundary"
+        ),
+        expected_vulnerable_behavior=(
+            "the declared allowed requests and the single excess request are all accepted"
+        ),
+    )
+
+
+def _known_default_credential(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.KNOWN_DEFAULT_CREDENTIAL,
+        finding_id,
+        preconditions=[
+            "the exact vendor/bootstrap credential is documented and supplied for a LOCAL fixture",
+            "one authentication attempt is sufficient to distinguish enabled from disabled default access",
+        ],
+        required_authority=["fixture_default_credential_test"],
+        actions=[
+            "submit the exact known default credential once to the local fixture",
+            "record only the response status and body digest; keep the credential ephemeral",
+        ],
+        expected_secure_behavior="the exact known default credential is rejected",
+        expected_vulnerable_behavior="the exact known default credential authenticates successfully",
+    )
+
+
+def _session_revocation(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.SESSION_REVOCATION,
+        finding_id,
+        preconditions=[
+            "an authenticated fixture session reaches one harmless protected read",
+            "the fixture exposes a deterministic operator-controlled revocation hook",
+            "the exact same session can be replayed after revocation",
+        ],
+        required_authority=["fixture_authenticated_session", "fixture_session_revocation"],
+        actions=[
+            "request the protected fixture resource with the authenticated session and record the control",
+            "revoke that exact fixture session through the operator-supplied local revocation hook",
+            "replay the same session against the same protected resource",
+        ],
+        expected_secure_behavior=(
+            "the pre-revocation control succeeds and the exact same session is denied after revocation"
+        ),
+        expected_vulnerable_behavior=(
+            "the exact same revoked session continues to reach the protected resource"
+        ),
+    )
+
+def _state_transition(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.STATE_TRANSITION,
+        finding_id,
+        preconditions=[
+            "the fixture has a deterministic readable starting state",
+            "one harmless transition request represents an operator-declared forbidden state edge",
+            "the post-request state can be read without exposing credential material",
+        ],
+        required_authority=["fixture_write_access", "fixture_state_readback"],
+        actions=[
+            "read and verify the fixture starting state",
+            "issue exactly one bounded forbidden-transition request",
+            "read the resulting fixture state and compare it with the declared safe and forbidden outcomes",
+        ],
+        expected_secure_behavior=(
+            "the declared forbidden target state is not reached and the fixture remains in the supplied safe state"
+        ),
+        expected_vulnerable_behavior=(
+            "the request moves the fixture into the operator-declared forbidden target state"
+        ),
+    )
+
+def _payment_invariant(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.PAYMENT_INVARIANT,
+        finding_id,
+        preconditions=[
+            "the fixture exposes a deterministic balance or liability readback in integer minor units",
+            "one harmless charge or refund request has an operator-declared expected single-operation delta",
+            "replaying the exact same request is safe in the local fixture",
+        ],
+        required_authority=["fixture_write_access", "fixture_financial_readback"],
+        actions=[
+            "read the starting financial state",
+            "issue one bounded payment mutation and verify the exact declared delta",
+            "replay the exact same request once and verify it does not apply the financial delta twice",
+        ],
+        expected_secure_behavior=(
+            "the first request applies exactly the declared delta and replay leaves the financial state unchanged"
+        ),
+        expected_vulnerable_behavior=(
+            "the first request applies the declared delta and replay applies that same financial effect again"
+        ),
+    )
+
+
+def _workflow_sequence(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.WORKFLOW_SEQUENCE,
+        finding_id,
+        preconditions=[
+            "the local fixture has a deterministic start, intermediate, and final state",
+            "two harmless ordered mutations form one operator-declared legitimate workflow",
+            "an operator-controlled local reset hook can restore the exact starting state",
+        ],
+        required_authority=[
+            "fixture_write_access",
+            "fixture_state_readback",
+            "fixture_reset",
+        ],
+        actions=[
+            "verify the fixture starts in the declared starting state",
+            "execute step one and require the declared intermediate state",
+            "execute step two and require the declared final state",
+            "reset the local fixture and verify the starting state is restored",
+            "attempt step two directly from the starting state and compare the resulting state",
+        ],
+        expected_secure_behavior=(
+            "the ordered control reaches the final state, while direct step two from the start "
+            "is denied or leaves the fixture in the declared safe bypass state"
+        ),
+        expected_vulnerable_behavior=(
+            "the ordered control is valid and direct step two from the start reaches the final state "
+            "without the required intermediate step"
+        ),
+    )
+
+
+def _money_flow_invariant(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.MONEY_FLOW_INVARIANT,
+        finding_id,
+        preconditions=[
+            "the local fixture exposes a deterministic readback for every declared financial entity",
+            "one harmless money-moving request has an operator-declared expected delta vector",
+            "any forbidden partial or misrouted delta vector is declared explicitly",
+        ],
+        required_authority=["fixture_write_access", "fixture_financial_readback"],
+        actions=[
+            "read the starting balances for the declared financial entities",
+            "issue one bounded money-flow mutation and compare the exact observed delta vector",
+            "if the expected vector was established, replay the exact same request once",
+            "compare replay deltas for duplicate movement or preserved idempotency",
+        ],
+        expected_secure_behavior=(
+            "the first mutation matches the declared cross-entity delta vector and replay produces no additional movement"
+        ),
+        expected_vulnerable_behavior=(
+            "the first mutation reaches an explicitly forbidden delta vector or replay applies the expected money-flow vector again"
+        ),
+    )
+
+
+def _settlement_refund_sequence(finding_id: str) -> ProofPlan:
+    return _plan(
+        ProofClass.SETTLEMENT_REFUND_SEQUENCE,
+        finding_id,
+        preconditions=[
+            "the local fixture exposes deterministic balances for every declared financial entity",
+            "one harmless settlement mutation has an operator-declared delta vector",
+            "one harmless refund mutation has an operator-declared delta vector",
+            "replaying either exact request is safe in the local fixture",
+        ],
+        required_authority=["fixture_write_access", "fixture_financial_readback"],
+        actions=[
+            "read the starting balances for all declared entities",
+            "execute one settlement mutation and verify its exact cross-entity delta vector",
+            "replay the settlement once and require zero additional movement",
+            "execute one refund mutation and verify its exact cross-entity delta vector",
+            "replay the refund once and require zero additional movement",
+        ],
+        expected_secure_behavior=(
+            "settlement and refund each apply exactly once with the declared delta vectors, and both exact replays produce zero additional movement"
+        ),
+        expected_vulnerable_behavior=(
+            "a settlement or refund replay applies the same declared money movement again"
+        ),
+    )
+
+
 def _traversal(finding_id: str) -> ProofPlan:
     return _plan(
         ProofClass.PATH_TRAVERSAL,
@@ -267,4 +520,14 @@ _BUILDERS = {
     ProofClass.XSS_EXECUTION: _xss,
     ProofClass.SSRF_CALLBACK: _ssrf,
     ProofClass.PATH_TRAVERSAL: _traversal,
+    ProofClass.CSRF_REQUEST: _csrf,
+    ProofClass.CORS_POLICY: _cors_policy,
+    ProofClass.RATE_LIMIT_INVARIANT: _rate_limit,
+    ProofClass.KNOWN_DEFAULT_CREDENTIAL: _known_default_credential,
+    ProofClass.SESSION_REVOCATION: _session_revocation,
+    ProofClass.STATE_TRANSITION: _state_transition,
+    ProofClass.PAYMENT_INVARIANT: _payment_invariant,
+    ProofClass.WORKFLOW_SEQUENCE: _workflow_sequence,
+    ProofClass.MONEY_FLOW_INVARIANT: _money_flow_invariant,
+    ProofClass.SETTLEMENT_REFUND_SEQUENCE: _settlement_refund_sequence,
 }

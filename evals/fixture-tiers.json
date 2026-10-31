@@ -1,0 +1,137 @@
+{
+  "schema_version": "sechelix-fixture-tier-registry/v1",
+  "scope_note": "These tiers describe fixture realism and integration depth only. They are not production-effectiveness claims and do not replace an uncontaminated independent Arena assessment.",
+  "benchmarks": [
+    {
+      "benchmark_id": "blind-label-static-pairs",
+      "runner": "evals/run_evals.py",
+      "tier": "STATIC_PAIR",
+      "status": "MEASURED",
+      "properties": {
+        "runtime_execution": false,
+        "network_scope": "NONE",
+        "real_browser": false,
+        "durable_state": false,
+        "multi_step_workflow": false,
+        "deterministic_reset": false,
+        "auth_personas": 0,
+        "service_count": 0,
+        "async_boundary": false
+      },
+      "limitations": [
+        "Static source-fragment reasoning only; no runtime target is executed.",
+        "Does not measure independent verification, remediation, regression generation, or release gating."
+      ]
+    },
+    {
+      "benchmark_id": "dynamic-proof-primitives",
+      "runner": "evals/dynamic_proof_benchmark.py",
+      "tier": "LOCAL_PRIMITIVE",
+      "status": "MEASURED",
+      "properties": {
+        "runtime_execution": true,
+        "network_scope": "LOOPBACK_ONLY",
+        "real_browser": false,
+        "durable_state": false,
+        "multi_step_workflow": false,
+        "deterministic_reset": true,
+        "auth_personas": 0,
+        "service_count": 1,
+        "async_boundary": false
+      },
+      "reset_strategy": "Each bounded proof owns a deterministic LOCAL fixture reset or fresh fixture instance.",
+      "limitations": [
+        "Measures proof primitives rather than the full SecHelix agent workflow.",
+        "Loopback synthetic fixtures do not establish production behavior."
+      ]
+    },
+    {
+      "benchmark_id": "real-browser-xss",
+      "runner": "evals/real_browser_xss_benchmark.py",
+      "tier": "REAL_BROWSER_INTEGRATION",
+      "status": "AVAILABLE",
+      "properties": {
+        "runtime_execution": true,
+        "network_scope": "LOOPBACK_ONLY",
+        "real_browser": true,
+        "durable_state": false,
+        "multi_step_workflow": false,
+        "deterministic_reset": true,
+        "auth_personas": 0,
+        "service_count": 1,
+        "async_boundary": false
+      },
+      "reset_strategy": "Each benchmark run starts a fresh literal-loopback fixture and fresh browser context.",
+      "limitations": [
+        "Optional Playwright integration slice only.",
+        "Browser availability may block measurement and must not be converted into a clean result."
+      ]
+    },
+    {
+      "benchmark_id": "real-browser-session",
+      "runner": "evals/real_browser_session_benchmark.py",
+      "tier": "REAL_BROWSER_INTEGRATION",
+      "status": "AVAILABLE",
+      "properties": {
+        "runtime_execution": true,
+        "network_scope": "LOOPBACK_ONLY",
+        "real_browser": true,
+        "durable_state": false,
+        "multi_step_workflow": false,
+        "deterministic_reset": true,
+        "auth_personas": 2,
+        "service_count": 1,
+        "async_boundary": false
+      },
+      "reset_strategy": "Valid and invalid sessions use isolated contexts; revocation fixtures use deterministic LOCAL reset state.",
+      "limitations": [
+        "Measures browser session isolation and revocation integration, not end-to-end application behavior.",
+        "Session credential values are execution-only and are not persisted."
+      ]
+    },
+    {
+      "benchmark_id": "stateful-application-tier",
+      "runner": "evals/production_like_fixture.py",
+      "tier": "STATEFUL_APPLICATION",
+      "status": "AVAILABLE",
+      "properties": {
+        "runtime_execution": true,
+        "network_scope": "LOOPBACK_ONLY",
+        "real_browser": false,
+        "durable_state": true,
+        "multi_step_workflow": true,
+        "deterministic_reset": true,
+        "auth_personas": 3,
+        "service_count": 1,
+        "async_boundary": false
+      },
+      "reset_strategy": "The SQLite workflow store is dropped and recreated from a deterministic seed before each self-test run, restoring the order and removing refund state.",
+      "limitations": [
+        "The self-test measures the fixture contract only; it does not score SecHelix discovery, independent verification, remediation, regression generation, or release-gate correctness.",
+        "This is a controlled literal-loopback single-service fixture and does not establish production effectiveness."
+      ]
+    },
+    {
+      "benchmark_id": "composite-application-tier",
+      "runner": "evals/composite_application_fixture.py",
+      "tier": "COMPOSITE_APPLICATION",
+      "status": "AVAILABLE",
+      "properties": {
+        "runtime_execution": true,
+        "network_scope": "LOOPBACK_ONLY",
+        "real_browser": false,
+        "durable_state": true,
+        "multi_step_workflow": true,
+        "deterministic_reset": true,
+        "auth_personas": 3,
+        "service_count": 2,
+        "async_boundary": true
+      },
+      "reset_strategy": "The shared SQLite state is dropped and recreated from a deterministic seed, clearing workflow, outbox, and ledger state before each self-test.",
+      "limitations": [
+        "The self-test measures the controlled two-service fixture contract only; it does not score SecHelix discovery, verification, remediation, regression generation, or release-gate correctness.",
+        "The asynchronous boundary is a deterministic SQLite outbox between literal-loopback services, not a production message broker or production-effectiveness measurement."
+      ]
+    }
+  ]
+}
